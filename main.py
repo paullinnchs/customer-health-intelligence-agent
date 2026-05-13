@@ -41,12 +41,20 @@ Use this exact structure:
   "health_summary": "short customer health summary",
   "churn_risk": "Low or Medium or High",
   "arr_at_risk": 0,
-  "nrr_opportunity": "Low or Medium or High",
+  "estimated_nrr_impact": 100,
+  "expansion_opportunity_level": "Low or Medium or High",
   "risk_drivers": ["driver 1", "driver 2"],
   "expansion_opportunities": ["opportunity 1", "opportunity 2"],
   "recommended_next_step": "specific next action",
   "executive_alert": true
 }}
+
+Guidance:
+- estimated_nrr_impact should be a realistic percentage.
+- Below 100 means contraction or churn risk.
+- 100 means flat retention.
+- 105-110 means healthy expansion potential.
+- 110+ means strong expansion potential.
 
 Account Data:
 Account Name: {row["account_name"]}
@@ -110,9 +118,13 @@ def save_markdown_report(row, result):
 
 ${result['arr_at_risk']}
 
-## NRR Opportunity
+## Estimated NRR Impact
 
-{result['nrr_opportunity']}
+{result['estimated_nrr_impact']}%
+
+## Expansion Opportunity Level
+
+{result['expansion_opportunity_level']}
 
 ## Risk Drivers
 
@@ -147,7 +159,8 @@ def send_slack_alert(row, result):
 
 *⚠️ Churn Risk:* {result['churn_risk']}
 *💰 ARR at Risk:* ${result['arr_at_risk']}
-*📈 NRR Opportunity:* {result['nrr_opportunity']}
+*📊 Estimated NRR Impact:* {result['estimated_nrr_impact']}%
+*📈 Expansion Opportunity:* {result['expansion_opportunity_level']}
 
 *Health Summary*
 {result['health_summary']}
@@ -171,7 +184,8 @@ def should_alert(result):
         result["executive_alert"] is True
         or result["churn_risk"] == "High"
         or result["arr_at_risk"] >= 50000
-        or result["nrr_opportunity"] == "High"
+        or result["estimated_nrr_impact"] < 100
+        or result["expansion_opportunity_level"] == "High"
     )
 
 
@@ -191,7 +205,8 @@ def main():
 
             print("Churn Risk:", result["churn_risk"])
             print("ARR at Risk:", result["arr_at_risk"])
-            print("NRR Opportunity:", result["nrr_opportunity"])
+            print("Estimated NRR Impact:", f"{result['estimated_nrr_impact']}%")
+            print("Expansion Opportunity:", result["expansion_opportunity_level"])
 
             save_markdown_report(row, result)
 
