@@ -1,0 +1,5 @@
+account_name,arr,renewal_date,health_score,usage_trend,open_tickets,nps_score,last_activity_days,expansion_signal,time_to_value_days
+Acme Corp,150000,2026-07-15,42,declining,5,4,18,high,45
+BlueWave Logistics,72000,2026-12-15,86,increasing,1,9,2,high,14
+Northstar Analytics,48000,2026-06-20,35,declining,7,3,27,medium,60
+Pioneer Systems,95000,2026-09-30,68,stable,2,7,6,low,21
