@@ -1,0 +1,9 @@
+account_id,billing_status,days_past_due,contract_value,expansion_arr,contraction_arr
+ACCT-001,current,0,420000,0,0
+ACCT-002,current,0,510000,75000,0
+ACCT-003,current,0,310000,0,25000
+ACCT-004,current,0,275000,0,0
+ACCT-005,current,0,185000,0,0
+ACCT-006,current,0,390000,0,0
+ACCT-007,current,0,165000,0,40000
+ACCT-008,current,0,145000,50000,0

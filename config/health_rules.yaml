@@ -1,0 +1,31 @@
+# Customer Health Intelligence configuration
+#
+# These values control deterministic health-status bands, alert thresholds,
+# and portfolio routing. Adjust them for a client's portfolio without
+# rewriting the core analysis workflow.
+
+health_score_bands:
+  healthy_min: 80
+  monitor_min: 60
+  at_risk_min: 40
+
+alerts:
+  high_risk_min_arr: 250000
+  high_risk_max_days_to_renewal: 120
+  known_contraction_min_arr: 50000
+  known_expansion_min_arr: 50000
+
+priority_routing:
+  executive_churn_risk:
+    - High
+  executive_health_status:
+    - Critical
+  executive_on_known_contraction: true
+
+  csm_churn_risk:
+    - Medium
+  csm_health_status:
+    - Monitor
+    - At Risk
+
+  expansion_requires_low_churn: true

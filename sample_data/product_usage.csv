@@ -1,0 +1,9 @@
+account_id,monthly_active_users,licensed_users,login_change_60d_pct,core_feature_adoption_pct,automation_adoption_pct,usage_trend,last_active_date
+ACCT-001,114,180,-31,58,22,declining,2026-08-16
+ACCT-002,365,400,18,92,84,growing,2026-08-18
+ACCT-003,188,260,-8,71,54,slightly_declining,2026-08-17
+ACCT-004,205,230,3,88,67,stable,2026-08-18
+ACCT-005,76,150,-19,49,18,declining,2026-08-15
+ACCT-006,301,330,6,90,73,stable,2026-08-18
+ACCT-007,61,120,-37,41,12,declining,2026-08-14
+ACCT-008,132,145,29,94,89,growing,2026-08-18

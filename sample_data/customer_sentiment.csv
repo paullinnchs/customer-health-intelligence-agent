@@ -1,0 +1,9 @@
+account_id,survey_date,nps,previous_nps,sentiment,primary_feedback
+ACCT-001,2026-08-04,18,42,negative,Integration issues and inconsistent automation performance are limiting expected value
+ACCT-002,2026-08-08,67,61,positive,Strong adoption and measurable efficiency gains across recruiting teams
+ACCT-003,2026-08-02,36,41,neutral,Platform provides value but automation capabilities need additional optimization
+ACCT-004,2026-08-07,58,55,positive,Teams are seeing consistent value and adoption remains strong
+ACCT-005,2026-08-01,24,39,negative,Users need additional enablement to incorporate automation into daily workflows
+ACCT-006,2026-08-09,63,59,positive,Platform is meeting operational goals and executive stakeholders remain supportive
+ACCT-007,2026-08-03,5,31,negative,Recurring performance issues are creating frustration and reducing confidence in the platform
+ACCT-008,2026-08-11,72,64,positive,Strong results have increased interest in expanding usage across additional teams

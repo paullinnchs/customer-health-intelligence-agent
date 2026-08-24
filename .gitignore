@@ -3,4 +3,13 @@
 __pycache__/
 *.pyc
 *.log
+
+# Generated outputs
 outputs/
+
+# Never commit customer/client exports
+client_data/
+
+# Local OS/editor artifacts
+.DS_Store
+Thumbs.db

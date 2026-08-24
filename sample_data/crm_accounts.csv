@@ -1,0 +1,9 @@
+account_id,account_name,segment,arr,contract_start,renewal_date,csm,industry,employee_count,account_stage
+ACCT-001,Meridian Staffing Group,Enterprise,420000,2025-10-31,2026-10-30,Jordan Lee,Staffing & Recruiting,1850,Renewal
+ACCT-002,Nova Healthcare,Enterprise,510000,2025-12-15,2026-12-14,Taylor Brooks,Healthcare Technology,4200,Active
+ACCT-003,Atlas Logistics,Enterprise,310000,2026-01-20,2027-01-19,Jordan Lee,Logistics,2600,Active
+ACCT-004,Beacon Retail Group,Mid-Market,275000,2026-03-01,2027-02-28,Morgan Chen,Retail,3100,Active
+ACCT-005,Summit Hospitality,Mid-Market,185000,2026-02-10,2027-02-09,Taylor Brooks,Hospitality,1400,Active
+ACCT-006,Horizon Manufacturing,Enterprise,390000,2025-11-05,2026-11-04,Morgan Chen,Manufacturing,5200,Renewal
+ACCT-007,Apex Home Services,Mid-Market,165000,2025-09-15,2026-09-14,Jordan Lee,Home Services,980,Renewal
+ACCT-008,Vertex Workforce,Mid-Market,145000,2026-04-01,2027-03-31,Taylor Brooks,Workforce Technology,650,Active

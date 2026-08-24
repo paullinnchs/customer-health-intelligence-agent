@@ -1,0 +1,9 @@
+account_id,last_csm_meeting,last_exec_meeting,qbr_completed,champion_status,stakeholder_coverage,open_action_items
+ACCT-001,2026-07-21,2026-05-16,false,declining,low,4
+ACCT-002,2026-08-12,2026-07-30,true,strong,high,1
+ACCT-003,2026-08-05,2026-06-18,true,stable,medium,2
+ACCT-004,2026-08-10,2026-07-12,true,strong,high,1
+ACCT-005,2026-07-30,2026-06-25,false,stable,medium,3
+ACCT-006,2026-08-13,2026-07-24,true,strong,high,0
+ACCT-007,2026-07-08,2026-04-29,false,at_risk,low,5
+ACCT-008,2026-08-14,2026-08-01,true,strong,high,0
