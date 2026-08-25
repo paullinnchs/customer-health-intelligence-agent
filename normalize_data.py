@@ -16,6 +16,10 @@ Optional:
 
 Missing optional sources are represented explicitly in data_availability so
 the analysis layer does not confuse missing data with a healthy zero value.
+
+Client data is validated before processing. Required baseline fields must be
+present and dates must be YYYY-MM-DD, so a bad export fails with a message
+naming the source, account, and field rather than an unexplained exception.
 """
 
 import csv
@@ -35,19 +39,161 @@ DATA_DIR = Path(
 )
 OUTPUT_DIR = BASE_DIR / "outputs"
 
+DATE_FORMAT = "%Y-%m-%d"
+
+REQUIRED_ACCOUNT_FIELDS = (
+    "account_id",
+    "account_name",
+    "arr",
+    "renewal_date",
+)
+
+
+class DataValidationError(Exception):
+    """Raised when client data cannot be processed as supplied."""
+
 
 def read_csv(filename, required=False):
     path = DATA_DIR / filename
 
     if not path.exists():
         if required:
-            raise FileNotFoundError(
-                f"Required data file not found: {path}"
+            raise DataValidationError(
+                f"Required data file not found: {path}\n"
+                f"The customer account list is the one mandatory source."
             )
         return []
 
     with open(path, "r", encoding="utf-8-sig", newline="") as file:
         return list(csv.DictReader(file))
+
+
+def describe_row(source, row_number, account_id=None):
+    """A consistent way to point a client at the exact row that failed."""
+    location = f"{source} (row {row_number})"
+
+    if account_id:
+        return f"{location}, account {account_id}"
+
+    return location
+
+
+def validate_crm_accounts(crm_accounts):
+    """
+    Validate the required baseline before any processing happens.
+
+    Every problem across the whole file is collected and reported together so a
+    client can fix one export in one pass instead of one row per run.
+    """
+    problems = []
+    seen_ids = {}
+
+    if not crm_accounts:
+        raise DataValidationError(
+            "crm_accounts.csv contains no account rows."
+        )
+
+    for index, account in enumerate(crm_accounts, start=2):
+        account_id = (account.get("account_id") or "").strip()
+        where = describe_row("crm_accounts.csv", index, account_id or None)
+
+        for field in REQUIRED_ACCOUNT_FIELDS:
+            if field not in account:
+                problems.append(
+                    f"{where}: required column '{field}' is missing from the file."
+                )
+            elif (account.get(field) or "").strip() == "":
+                problems.append(
+                    f"{where}: required field '{field}' is blank."
+                )
+
+        if account_id:
+            if account_id in seen_ids:
+                problems.append(
+                    f"{where}: duplicate account_id, already used on row "
+                    f"{seen_ids[account_id]}."
+                )
+            else:
+                seen_ids[account_id] = index
+
+        arr = (account.get("arr") or "").strip()
+        if arr:
+            try:
+                float(arr)
+            except ValueError:
+                problems.append(
+                    f"{where}: field 'arr' must be a plain number without "
+                    f"currency symbols or commas, got '{arr}'."
+                )
+
+        renewal_date = (account.get("renewal_date") or "").strip()
+        if renewal_date:
+            problems.extend(
+                validate_date(
+                    renewal_date,
+                    "renewal_date",
+                    "crm_accounts.csv",
+                    index,
+                    account_id,
+                )
+            )
+
+        contract_start = (account.get("contract_start") or "").strip()
+        if contract_start:
+            problems.extend(
+                validate_date(
+                    contract_start,
+                    "contract_start",
+                    "crm_accounts.csv",
+                    index,
+                    account_id,
+                )
+            )
+
+    if problems:
+        raise DataValidationError(
+            "Customer account data could not be processed:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+
+def validate_date(value, field, source, row_number, account_id=None):
+    """Return a list of problems (empty when the date is valid)."""
+    try:
+        datetime.strptime(value, DATE_FORMAT)
+    except ValueError:
+        where = describe_row(source, row_number, account_id)
+        return [
+            f"{where}: field '{field}' must use the YYYY-MM-DD date format, "
+            f"got '{value}'."
+        ]
+
+    return []
+
+
+def validate_optional_dates(rows, source, fields):
+    """
+    Validate dates in the optional sources.
+
+    These are not required, but a malformed value would otherwise surface as a
+    raw strptime traceback with no indication of which file or row caused it.
+    """
+    problems = []
+
+    for index, row in enumerate(rows, start=2):
+        account_id = (row.get("account_id") or "").strip()
+
+        for field in fields:
+            value = (row.get(field) or "").strip()
+
+            if value:
+                problems.extend(
+                    validate_date(
+                        value, field, source, index, account_id or None
+                    )
+                )
+
+    return problems
 
 
 def int_or_none(value):
@@ -66,7 +212,7 @@ def days_until(date_string):
     if not date_string:
         return None
 
-    target_date = datetime.strptime(date_string, "%Y-%m-%d")
+    target_date = datetime.strptime(date_string, DATE_FORMAT)
     today = datetime.today()
 
     return (target_date - today).days
@@ -76,7 +222,7 @@ def days_since(date_string):
     if not date_string:
         return None
 
-    event_date = datetime.strptime(date_string, "%Y-%m-%d")
+    event_date = datetime.strptime(date_string, DATE_FORMAT)
     today = datetime.today()
 
     return (today - event_date).days
@@ -97,6 +243,8 @@ def normalize_accounts():
         required=True,
     )
 
+    validate_crm_accounts(crm_accounts)
+
     product_usage = read_csv(
         "product_usage.csv",
     )
@@ -116,6 +264,36 @@ def normalize_accounts():
     billing = read_csv(
         "billing.csv",
     )
+
+    date_problems = []
+    date_problems.extend(
+        validate_optional_dates(
+            product_usage, "product_usage.csv", ["last_active_date"]
+        )
+    )
+    date_problems.extend(
+        validate_optional_dates(
+            support_tickets, "support_tickets.csv", ["created_date"]
+        )
+    )
+    date_problems.extend(
+        validate_optional_dates(
+            customer_engagement,
+            "customer_engagement.csv",
+            ["last_csm_meeting", "last_exec_meeting"],
+        )
+    )
+    date_problems.extend(
+        validate_optional_dates(
+            customer_sentiment, "customer_sentiment.csv", ["survey_date"]
+        )
+    )
+
+    if date_problems:
+        raise DataValidationError(
+            "Customer health signal data could not be processed:\n  - "
+            + "\n  - ".join(date_problems)
+        )
 
     source_presence = {
         "crm": bool(crm_accounts),
@@ -458,6 +636,9 @@ def normalize_accounts():
                     ),
             },
 
+            # Blank commercial cells stay None rather than collapsing to 0.
+            # A blank is "not available", which the scoring model treats as an
+            # unavailable signal. Only an explicit 0 means "none known".
             "billing": {
                 "billing_status":
                     billing_record.get(
@@ -470,28 +651,22 @@ def normalize_accounts():
                         )
                     ),
                 "contract_value":
-                    float(
+                    float_or_none(
                         billing_record.get(
-                            "contract_value",
-                            0,
+                            "contract_value"
                         )
-                        or 0
                     ),
                 "expansion_arr":
-                    float(
+                    float_or_none(
                         billing_record.get(
-                            "expansion_arr",
-                            0,
+                            "expansion_arr"
                         )
-                        or 0
                     ),
                 "contraction_arr":
-                    float(
+                    float_or_none(
                         billing_record.get(
-                            "contraction_arr",
-                            0,
+                            "contraction_arr"
                         )
-                        or 0
                     ),
             },
         }

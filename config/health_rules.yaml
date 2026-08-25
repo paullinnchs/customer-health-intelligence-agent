@@ -1,31 +1,324 @@
-# Customer Health Intelligence configuration
+# =============================================================================
+# PLS Customer Health Intelligence — Configuration
+# =============================================================================
+# Everything in this file is calibratable for a client portfolio. The
+# deterministic PLS Baseline Health Model reads its weights, bands, and
+# thresholds from here, so a client can be re-calibrated without editing Python.
 #
-# These values control deterministic health-status bands, alert thresholds,
-# and portfolio routing. Adjust them for a client's portfolio without
-# rewriting the core analysis workflow.
+# Band evaluation rules:
+#   - `at_least` bands are checked in the order listed; the first band whose
+#     threshold the value meets or exceeds wins. `below_points` applies when no
+#     band matches.
+#   - `at_most` bands are checked in the order listed; the first band whose
+#     threshold the value is at or under wins. `above_points` applies when no
+#     band matches.
+#   - `values` maps are matched case-insensitively. A value that is not present
+#     in the map makes the subcomponent UNAVAILABLE rather than scoring zero.
+# =============================================================================
 
+
+# -----------------------------------------------------------------------------
+# PLS Baseline Status Bands — configurable during customer calibration.
+# -----------------------------------------------------------------------------
 health_score_bands:
   healthy_min: 80
   monitor_min: 60
   at_risk_min: 40
 
+
+# -----------------------------------------------------------------------------
+# Retention Risk — derived deterministically from Health Status.
+# Replaces the previous LLM-generated Churn Risk. The model never generates
+# this value; it is a straight mapping from the deterministic Health Status.
+# -----------------------------------------------------------------------------
+retention_risk_by_status:
+  Healthy: Low
+  Monitor: Medium
+  At Risk: Medium
+  Critical: High
+
+
+# =============================================================================
+# PLS BASELINE HEALTH MODEL
+# =============================================================================
+# Configured total = 97 points across five components.
+#
+# Product Adoption & Usage      30
+# Customer Engagement           20
+# Customer Sentiment            20
+# Support Health                15   (3 of these are unavailable until a client
+#                                     resolution benchmark is calibrated)
+# Commercial & Renewal Position 12
+#
+# NOTE ON THE 12-POINT COMMERCIAL COMPONENT
+# The approved model specified 15 points for Commercial & Renewal Position,
+# including a 3-point "Renewal + Risk Interaction" subcomponent. The current
+# schema has no field identifying "no material concern / meaningful concern /
+# confirmed non-renewal", and that subcomponent was circular (it fed the score
+# that Retention Risk is derived from). It was dropped by explicit approval on
+# 2026-08-24, reducing Commercial to 12 points and the configured total to 97.
+# The confirmed-non-renewal Retention Risk override was dropped with it.
+#
+# MISSING SIGNALS
+# Missing data never scores zero. Each subcomponent reports whether it was
+# available; the Health Score is normalized as:
+#     points_earned / points_available * 100
+# and Signal Coverage is reported as:
+#     points_available / points_configured * 100
+# =============================================================================
+health_model:
+
+  # ---------------------------------------------------------------------------
+  # 1. PRODUCT ADOPTION & USAGE — 30 points
+  # ---------------------------------------------------------------------------
+  product_adoption:
+    label: Product Adoption & Usage
+
+    license_utilization_pct:
+      label: License Utilization
+      bands:
+        - { at_least: 80, points: 10 }
+        - { at_least: 60, points: 7 }
+        - { at_least: 40, points: 4 }
+      below_points: 1
+
+    login_change_60d_pct:
+      label: 60-Day Login Trend
+      bands:
+        - { at_least: 5, points: 6 }
+        - { at_least: -4, points: 5 }
+        - { at_least: -19, points: 3 }
+      below_points: 0
+
+    core_feature_adoption_pct:
+      label: Core Feature Adoption
+      bands:
+        - { at_least: 75, points: 8 }
+        - { at_least: 50, points: 6 }
+        - { at_least: 25, points: 3 }
+      below_points: 1
+
+    automation_adoption_pct:
+      label: Automation / Advanced Adoption
+      bands:
+        - { at_least: 50, points: 6 }
+        - { at_least: 25, points: 4 }
+        - { at_least: 1, points: 2 }
+      below_points: 0
+
+  # ---------------------------------------------------------------------------
+  # 2. CUSTOMER ENGAGEMENT — 20 points
+  # ---------------------------------------------------------------------------
+  customer_engagement:
+    label: Customer Engagement
+
+    days_since_last_csm_meeting:
+      label: CSM Engagement Cadence
+      bands:
+        - { at_most: 30, points: 4 }
+        - { at_most: 60, points: 3 }
+        - { at_most: 90, points: 1 }
+      above_points: 0
+
+    days_since_last_exec_meeting:
+      label: Executive Engagement
+      bands:
+        - { at_most: 60, points: 4 }
+        - { at_most: 90, points: 3 }
+        - { at_most: 120, points: 1 }
+      above_points: 0
+
+    qbr_completed:
+      label: QBR Completed
+      true_points: 3
+      false_points: 0
+
+    champion_status:
+      label: Champion Status
+      # `at_risk` is client vocabulary present in the source data. It was mapped
+      # to Declining (1 point) by explicit approval on 2026-08-24. Any value not
+      # listed here makes this subcomponent unavailable rather than scoring 0.
+      max_points: 4
+      values:
+        strong: 4
+        stable: 3
+        declining: 1
+        at_risk: 1
+        lost: 0
+        none: 0
+
+    stakeholder_coverage:
+      label: Stakeholder Coverage
+      # `high` / `medium` / `low` is the vocabulary in the source data;
+      # Strong / Moderate / Low is the model vocabulary. Both are accepted.
+      max_points: 3
+      values:
+        strong: 3
+        high: 3
+        moderate: 2
+        medium: 2
+        low: 0
+
+    open_action_items:
+      label: Open Action Items
+      bands:
+        - { at_most: 2, points: 2 }
+        - { at_most: 5, points: 1 }
+      above_points: 0
+
+  # ---------------------------------------------------------------------------
+  # 3. CUSTOMER SENTIMENT — 20 points
+  # ---------------------------------------------------------------------------
+  customer_sentiment:
+    label: Customer Sentiment
+
+    current_nps:
+      label: Current NPS
+      bands:
+        - { at_least: 50, points: 8 }
+        - { at_least: 30, points: 6 }
+        - { at_least: 0, points: 4 }
+        - { at_least: -29, points: 2 }
+      below_points: 0
+
+    nps_change:
+      label: NPS Trend
+      bands:
+        - { at_least: 10, points: 5 }
+        - { at_least: 1, points: 4 }
+        - { at_least: 0, points: 3 }
+        - { at_least: -9, points: 2 }
+      below_points: 0
+
+    sentiment:
+      label: Qualitative Sentiment
+      max_points: 7
+      values:
+        positive: 7
+        neutral: 4
+        negative: 0
+
+  # ---------------------------------------------------------------------------
+  # 4. SUPPORT HEALTH — 15 points
+  # ---------------------------------------------------------------------------
+  support_health:
+    label: Support Health
+
+    high_severity_tickets:
+      label: High-Severity Tickets
+      bands:
+        - { at_most: 0, points: 5 }
+        - { at_most: 1, points: 3 }
+        - { at_most: 2, points: 1 }
+      above_points: 0
+
+    open_tickets:
+      label: Open Tickets
+      bands:
+        - { at_most: 2, points: 3 }
+        - { at_most: 5, points: 2 }
+      above_points: 0
+
+    average_csat:
+      label: Average CSAT
+      bands:
+        - { at_least: 4.5, points: 4 }
+        - { at_least: 4.0, points: 3 }
+        - { at_least: 3.0, points: 1 }
+      below_points: 0
+
+    average_resolution_hours:
+      label: Resolution Performance
+      # Worth up to 3 points, but resolution time only means something against
+      # a client-specific benchmark. There is deliberately no universal default.
+      # Leave `bands` empty and this subcomponent is treated as UNAVAILABLE,
+      # which is the correct state until a client benchmark is calibrated.
+      # To calibrate, add `at_most` bands in hours totalling 3 points, e.g.
+      #   bands:
+      #     - { at_most: 24, points: 3 }
+      #     - { at_most: 48, points: 2 }
+      #     - { at_most: 72, points: 1 }
+      #   above_points: 0
+      max_points: 3
+      bands: []
+      above_points: 0
+
+  # ---------------------------------------------------------------------------
+  # 5. COMMERCIAL & RENEWAL POSITION — 12 points
+  # ---------------------------------------------------------------------------
+  commercial_renewal:
+    label: Commercial & Renewal Position
+
+    known_contraction:
+      label: Known Contraction
+      # Sourced only from client billing data. Unavailable when the account has
+      # no billing record, so an absent billing source cannot earn these points.
+      none_points: 5
+      any_points: 0
+
+    billing_status:
+      label: Billing Status
+      # Scored from `days_past_due`, which is unambiguous, rather than the
+      # free-text `billing_status` column. days_past_due == 0 is Current.
+      #
+      # REQUIRED FOR CALIBRATION: `minor_overdue_max_days` is the boundary
+      # between minor and materially overdue. It is intentionally null. Until it
+      # is set, any account with days_past_due > 0 is treated as UNAVAILABLE for
+      # this subcomponent rather than scored against an invented threshold.
+      max_points: 4
+      current_points: 4
+      minor_overdue_max_days: null
+      minor_overdue_points: 2
+      materially_overdue_points: 0
+
+    renewal_proximity:
+      label: Renewal Proximity
+      # Urgency and context only. Proximity to renewal is not churn by itself.
+      # Accounts past their renewal date fall into the final band.
+      bands:
+        - { at_least: 181, points: 3 }
+        - { at_least: 121, points: 3 }
+        - { at_least: 61, points: 2 }
+      below_points: 1
+
+
+# =============================================================================
+# PRIORITY ROUTING
+# =============================================================================
+# Primary attention routing has three mutually exclusive groups. Monitor is a
+# Health Status, not an attention group; Monitor accounts route to CSM Attention.
+#
+# Expansion Opportunity is NOT a routing group. It is evaluated independently
+# (see below) so an account can be Executive Attention and an Expansion
+# Opportunity at the same time.
+# =============================================================================
+priority_routing:
+  executive_retention_risk:
+    - High
+  executive_health_status:
+    - Critical
+  executive_on_known_contraction: true
+
+  csm_retention_risk:
+    - Medium
+  csm_health_status:
+    - Monitor
+    - At Risk
+
+
+# =============================================================================
+# ALERTS
+# =============================================================================
+# Thresholds for executive Slack alerting. Internal operational routing only —
+# alert counts are not a customer-facing portfolio metric.
+# =============================================================================
 alerts:
   high_risk_min_arr: 250000
   high_risk_max_days_to_renewal: 120
   known_contraction_min_arr: 50000
   known_expansion_min_arr: 50000
 
-priority_routing:
-  executive_churn_risk:
-    - High
-  executive_health_status:
-    - Critical
-  executive_on_known_contraction: true
-
-  csm_churn_risk:
-    - Medium
-  csm_health_status:
-    - Monitor
-    - At Risk
-
-  expansion_requires_low_churn: true
+  # Expansion alerting stays gated on Low retention risk by explicit approval on
+  # 2026-08-24. This gates the ALERT only. It does not gate Expansion
+  # Opportunity identification, which is independent of risk and routing.
+  expansion_alert_requires_low_risk: true

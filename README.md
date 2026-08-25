@@ -6,7 +6,7 @@ This repository is the engine behind the **PLS Customer Health System**.
 
 It is designed around a simple operating model:
 
-**customer data → normalization → AI-assisted health analysis → deterministic revenue/routing logic → account reports → portfolio priorities → optional alerts**
+**customer data → validation → normalization → deterministic health scoring → AI-assisted interpretation → deterministic routing logic → account reports → portfolio priorities → optional alerts**
 
 ---
 
@@ -41,12 +41,14 @@ This workflow consolidates those signals into one account-level record and answe
 
 `crm_accounts.csv`
 
-Minimum commercial/account baseline:
+Minimum commercial/account baseline, validated before processing:
 
 - account_id
 - account_name
 - arr
 - renewal_date
+
+These four are enforced. A missing column, a blank value, a duplicate `account_id`, a non-numeric `arr`, or a date that is not `YYYY-MM-DD` fails the run with a message naming the file, row, account, and field. Dates in the optional sources are validated the same way, so a malformed export never surfaces as an unexplained traceback.
 
 The sample schema also includes fields such as segment, CSM, industry, employee count, contract start, and account stage.
 
@@ -93,35 +95,71 @@ Billing / Commercial Data ─────┘
 
 ---
 
-## What Is AI-Assisted vs. Deterministic
+## The PLS Baseline Health Model
+
+The Health Score is deterministic. The same data and the same configuration always produce the same score. Claude never generates it.
+
+Five components, 97 configured points:
+
+| Component | Points | Subcomponents |
+|---|---:|---|
+| Product Adoption & Usage | 30 | License utilization, 60-day login trend, core feature adoption, automation adoption |
+| Customer Engagement | 20 | CSM cadence, executive engagement, QBR, champion status, stakeholder coverage, open action items |
+| Customer Sentiment | 20 | Current NPS, NPS trend, qualitative sentiment |
+| Support Health | 15 | High-severity tickets, open tickets, average CSAT, resolution performance |
+| Commercial & Renewal Position | 12 | Known contraction, billing status, renewal proximity |
+
+Two subcomponents are unavailable by design until they are calibrated for a client:
+
+- **Resolution Performance (3 pts)** — resolution time is meaningless without a client benchmark, so there is deliberately no universal default. Until `bands` are configured it is unavailable.
+- **Billing Status for overdue accounts (4 pts)** — `minor_overdue_max_days` is intentionally null. Accounts with `days_past_due > 0` are unavailable rather than scored against an invented threshold. Accounts at zero days past due score normally.
+
+The approved model originally specified 15 points for Commercial & Renewal Position, including a 3-point Renewal + Risk Interaction subcomponent. The schema has no field identifying "no material concern / meaningful concern / confirmed non-renewal", and that subcomponent was circular because it fed the score that Retention Risk is derived from. It was dropped by explicit approval, reducing Commercial to 12 points and the configured total to 97.
+
+### Missing signals never score zero
+
+Each subcomponent reports whether it was available. The score is normalized against the points that were actually available:
+
+```text
+Health Score    = points_earned / points_available * 100
+Signal Coverage = points_available / points_configured * 100
+```
+
+An account with no NPS data is not penalised for it; the sentiment points simply leave both the numerator and the denominator, and Signal Coverage drops so the gap is visible.
+
+---
+
+## What Is Deterministic vs. AI-Assisted
+
+### Deterministic
+
+`health_model.py` and `main.py` handle:
+
+- Component and subcomponent scoring
+- Composite Health Score
+- Health Status from configured score bands
+- Retention Risk from Health Status
+- Signal Coverage
+- Revenue Exposure
+- Known Contraction and Known Expansion from source data
+- Expansion Opportunity identification
+- Executive / CSM routing
+- Alert thresholds
+- Portfolio aggregation
 
 ### AI-Assisted
 
-Claude evaluates the combined customer signals and returns:
+Claude receives the deterministic results as context and returns interpretation only:
 
-- Health Score
-- Churn Risk
 - Health Summary
 - Risk Drivers
 - Positive Signals
 - Expansion Evidence
 - Recommended Next Step
 
-These are analytical assessments based on the supplied account evidence.
+The prompt explicitly forbids the model from producing a score, a status, a risk level, or any dollar figure, and from contradicting the deterministic classifications. Every statement must trace back to the supplied account data or the scoring results.
 
-### Deterministic
-
-Python handles:
-
-- Health Status from configured score bands
-- Revenue Exposure calculation
-- Known Contraction from source data
-- Known Expansion from source data
-- Executive / CSM / Expansion routing
-- Alert thresholds
-- Portfolio aggregation
-
-This intentionally prevents the model from inventing commercial dollar values or deciding routing thresholds on its own.
+If narrative generation fails for an account, the deterministic results still stand and the account remains in the portfolio. Only the narrative is marked unavailable.
 
 ---
 
@@ -151,39 +189,56 @@ It is not estimated by AI.
 
 ### Health Score
 
-AI-assisted assessment of the combined account signals.
+Deterministic PLS Baseline Health Model result. Points earned across available signals, normalized to 100.
 
-It is not a financial forecast.
+It is not AI-generated and it is not a financial forecast.
 
 ### Health Status
 
 Derived deterministically from the Health Score using the configured score bands.
 
+### Retention Risk
+
+Derived deterministically from Health Status, replacing the previous AI-generated Churn Risk:
+
+| Health Status | Retention Risk |
+|---|---|
+| Healthy | Low |
+| Monitor | Medium |
+| At Risk | Medium |
+| Critical | High |
+
+### Signal Coverage
+
+The share of the configured scoring model that an account's available data supported.
+
+This is a measure of data completeness. It is **not** statistical confidence.
+
 ---
 
 ## Portfolio Priorities
 
-Each account is routed into one primary operating group:
+Each account is routed into exactly one primary attention group:
 
 ### Executive Attention
 
-High churn risk, Critical health, or known contraction requiring leadership visibility.
+High retention risk, Critical health, or known contraction requiring leadership visibility.
 
 ### CSM Attention
 
-Meaningful warning signals requiring active Customer Success management.
-
-### Expansion
-
-Healthy/low-risk accounts with explicit known expansion.
+Meaningful warning signals requiring active Customer Success management. Monitor and At Risk accounts land here — Monitor is a Health Status, not an attention group.
 
 ### Healthy / No Immediate Action
 
-Accounts currently showing healthy retention conditions without a material known expansion or contraction event.
+Accounts currently showing healthy retention conditions.
 
 Routing rules are configurable in:
 
 `config/health_rules.yaml`
+
+### Expansion Opportunity is separate
+
+Expansion is **not** an attention group. It is evaluated independently from Known Expansion in the source data, so an account can simultaneously be Executive Attention and an Expansion Opportunity. Expansion never improves or masks the Health Score.
 
 ---
 
@@ -191,14 +246,20 @@ Routing rules are configurable in:
 
 `config/health_rules.yaml` controls:
 
-- Health-score bands
+- PLS Baseline Status Bands
+- Retention Risk mapping
+- Every component and subcomponent scoring band in the PLS Baseline Health Model
+- Champion status and stakeholder coverage vocabulary
+- The client resolution-performance benchmark
+- The minor / materially overdue billing boundary
 - Minimum ARR for high-risk executive alerts
 - Renewal-window threshold
 - Known-contraction alert threshold
 - Known-expansion alert threshold
-- Executive / CSM / Expansion routing
+- Whether expansion alerting is gated on Low retention risk
+- Executive / CSM routing
 
-This allows the workflow to fit different portfolio sizes without rewriting `main.py`.
+This allows the model to be calibrated for a client portfolio without rewriting Python.
 
 ---
 
@@ -218,10 +279,14 @@ Each report includes:
 
 - Account snapshot
 - Health Score / Status
-- Churn Risk
+- Retention Risk
+- Signal Coverage
 - Revenue Exposure
 - Known Contraction
 - Known Expansion
+- Expansion Opportunity
+- Health Score Breakdown — points earned / points available per component
+- Which signals were unavailable
 - Risk Drivers
 - Positive Signals
 - Expansion Evidence
@@ -245,11 +310,14 @@ The portfolio summary includes:
 - Net Known Revenue Movement
 - Executive Attention
 - CSM Attention
-- Expansion Opportunities
+- Healthy / No Immediate Action
+- Expansion Opportunities, counted independently of attention routing
 
 ### Optional Slack Alerts
 
 Slack alerts are sent only when configured executive thresholds are met.
+
+Alert counts are internal operational logging. They are deliberately not a customer-facing portfolio intelligence metric.
 
 ---
 
