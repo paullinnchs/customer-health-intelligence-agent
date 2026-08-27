@@ -1,0 +1,41 @@
+# =============================================================================
+# CHIA CLIENT CONFIGURATION — DEMO
+# =============================================================================
+# A demonstration workspace built from a COPY of sample_data. It exists to
+# exercise the full client-run path end to end without touching sample_data or
+# any real client workspace.
+#
+#   uv run python main.py clients/demo --validate-only
+#   uv run python main.py clients/demo --no-slack
+#
+# This workspace deliberately runs on the PURE PLS BASELINE with no overrides,
+# so its results are directly comparable to the pre-client-layer engine.
+# =============================================================================
+
+
+client:
+  name: "Demo Portfolio"
+  slug: "demo"
+  engagement: "PLS-DEMO"
+  contact: "Paul Linn, Paul Linn Solutions"
+
+
+baseline: "config/health_rules.yaml"
+
+
+slack:
+  enabled: false
+  webhook_env_var: null
+
+
+# No overrides. The two uncalibrated subcomponents — Resolution Performance and
+# the overdue Billing Status boundary — stay unavailable, which is the correct
+# state for a portfolio with no agreed client benchmark. Signal Coverage
+# reports the gap rather than hiding it.
+overrides: []
+
+
+notes: >
+  Demonstration data copied from sample_data on 2026-08-27. Contains no real
+  customer information. Used to verify the client-run operating layer, output
+  isolation, and run metadata.

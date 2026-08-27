@@ -4,15 +4,20 @@ normalize_data.py
 Normalizes customer-health signals from multiple CSV sources into one
 account-level record for analysis.
 
+The input directory is supplied by the caller. In a client run that is always
+the selected client's input/ directory, resolved by ClientWorkspace, so no
+ambient environment variable can redirect one client's run at another client's
+data.
+
 Required:
-- sample_data/crm_accounts.csv
+- <input_dir>/crm_accounts.csv
 
 Optional:
-- sample_data/product_usage.csv
-- sample_data/support_tickets.csv
-- sample_data/customer_engagement.csv
-- sample_data/customer_sentiment.csv
-- sample_data/billing.csv
+- <input_dir>/product_usage.csv
+- <input_dir>/support_tickets.csv
+- <input_dir>/customer_engagement.csv
+- <input_dir>/customer_sentiment.csv
+- <input_dir>/billing.csv
 
 Missing optional sources are represented explicitly in data_availability so
 the analysis layer does not confuse missing data with a healthy zero value.
@@ -20,26 +25,26 @@ the analysis layer does not confuse missing data with a healthy zero value.
 Client data is validated before processing. Required baseline fields must be
 present and dates must be YYYY-MM-DD, so a bad export fails with a message
 naming the source, account, and field rather than an unexplained exception.
+
+All date arithmetic is measured from an injected effective date rather than
+the wall clock, so a run can be reproduced exactly from its manifest.
 """
 
 import csv
 import json
-import os
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from chia_errors import ClientRunError
+
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(
-    os.getenv(
-        "CUSTOMER_HEALTH_DATA_DIR",
-        str(BASE_DIR / "sample_data"),
-    )
-)
-OUTPUT_DIR = BASE_DIR / "outputs"
+DEFAULT_DATA_DIR = BASE_DIR / "sample_data"
 
 DATE_FORMAT = "%Y-%m-%d"
+
+NORMALIZED_FILENAME = "normalized_accounts.json"
 
 REQUIRED_ACCOUNT_FIELDS = (
     "account_id",
@@ -48,19 +53,31 @@ REQUIRED_ACCOUNT_FIELDS = (
     "renewal_date",
 )
 
+OPTIONAL_SOURCES = (
+    "product_usage.csv",
+    "support_tickets.csv",
+    "customer_engagement.csv",
+    "customer_sentiment.csv",
+    "billing.csv",
+)
 
-class DataValidationError(Exception):
+
+class DataValidationError(ClientRunError):
     """Raised when client data cannot be processed as supplied."""
 
+    label = "Data validation failed"
 
-def read_csv(filename, required=False):
-    path = DATA_DIR / filename
+
+def read_csv(filename, data_dir, required=False):
+    path = Path(data_dir) / filename
 
     if not path.exists():
         if required:
             raise DataValidationError(
                 f"Required data file not found: {path}\n"
-                f"The customer account list is the one mandatory source."
+                f"The customer account list is the one mandatory source.",
+                "Place crm_accounts.csv in the client's input/ directory. "
+                "sample_data/crm_accounts.csv shows the expected schema.",
             )
         return []
 
@@ -90,7 +107,9 @@ def validate_crm_accounts(crm_accounts):
 
     if not crm_accounts:
         raise DataValidationError(
-            "crm_accounts.csv contains no account rows."
+            "crm_accounts.csv contains no account rows.",
+            "Export at least one account. A header row alone is not enough "
+            "to run a portfolio.",
         )
 
     for index, account in enumerate(crm_accounts, start=2):
@@ -153,7 +172,10 @@ def validate_crm_accounts(crm_accounts):
     if problems:
         raise DataValidationError(
             "Customer account data could not be processed:\n  - "
-            + "\n  - ".join(problems)
+            + "\n  - ".join(problems),
+            "Correct crm_accounts.csv in the client's input/ directory and "
+            "run again. Every problem found in the file is listed above, so "
+            "one pass should be enough.",
         )
 
 
@@ -208,24 +230,29 @@ def float_or_none(value):
     return float(value)
 
 
-def days_until(date_string):
+def days_until(date_string, as_of):
+    """
+    Days from the run's effective date to a future date.
+
+    `as_of` is injected rather than read from the clock so that a run recorded
+    in a manifest can be replayed exactly. Passing today's date reproduces the
+    previous behaviour.
+    """
     if not date_string:
         return None
 
     target_date = datetime.strptime(date_string, DATE_FORMAT)
-    today = datetime.today()
 
-    return (target_date - today).days
+    return (target_date - as_of).days
 
 
-def days_since(date_string):
+def days_since(date_string, as_of):
     if not date_string:
         return None
 
     event_date = datetime.strptime(date_string, DATE_FORMAT)
-    today = datetime.today()
 
-    return (today - event_date).days
+    return (as_of - event_date).days
 
 
 def average(values):
@@ -237,9 +264,26 @@ def average(values):
     return round(sum(clean) / len(clean), 1)
 
 
-def normalize_accounts():
+def normalize_accounts(input_dir=None, output_dir=None, as_of=None):
+    """
+    Build one normalized account record per CRM account.
+
+    `input_dir`  the directory holding this run's CSV exports. In a client run
+                 this is always the selected client's input/ directory.
+    `output_dir` where normalized_accounts.json is written. Pass None to skip
+                 writing entirely (used by --validate-only).
+    `as_of`      the run's effective date, used for all day arithmetic.
+
+    Returns (accounts, source_report). The source report records which files
+    were supplied and which rows referenced unknown accounts, so the run can
+    report data-quality conditions without re-reading the inputs.
+    """
+    data_dir = Path(input_dir) if input_dir else DEFAULT_DATA_DIR
+    as_of = as_of or datetime.today()
+
     crm_accounts = read_csv(
         "crm_accounts.csv",
+        data_dir,
         required=True,
     )
 
@@ -247,22 +291,27 @@ def normalize_accounts():
 
     product_usage = read_csv(
         "product_usage.csv",
+        data_dir,
     )
 
     support_tickets = read_csv(
         "support_tickets.csv",
+        data_dir,
     )
 
     customer_engagement = read_csv(
         "customer_engagement.csv",
+        data_dir,
     )
 
     customer_sentiment = read_csv(
         "customer_sentiment.csv",
+        data_dir,
     )
 
     billing = read_csv(
         "billing.csv",
+        data_dir,
     )
 
     date_problems = []
@@ -292,7 +341,9 @@ def normalize_accounts():
     if date_problems:
         raise DataValidationError(
             "Customer health signal data could not be processed:\n  - "
-            + "\n  - ".join(date_problems)
+            + "\n  - ".join(date_problems),
+            "Dates must use the YYYY-MM-DD format. Correct the files listed "
+            "above in the client's input/ directory and run again.",
         )
 
     source_presence = {
@@ -493,7 +544,8 @@ def normalize_accounts():
             "days_to_renewal": days_until(
                 account.get(
                     "renewal_date"
-                )
+                ),
+                as_of,
             ),
             "csm": account.get(
                 "csm"
@@ -589,7 +641,8 @@ def normalize_accounts():
                     days_since(
                         engagement.get(
                             "last_csm_meeting"
-                        )
+                        ),
+                        as_of,
                     ),
                 "last_exec_meeting":
                     engagement.get(
@@ -599,7 +652,8 @@ def normalize_accounts():
                     days_since(
                         engagement.get(
                             "last_exec_meeting"
-                        )
+                        ),
+                        as_of,
                     ),
                 "qbr_completed":
                     qbr_completed,
@@ -675,40 +729,91 @@ def normalize_accounts():
             normalized_record
         )
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    source_report = build_source_report(
+        data_dir,
+        crm_accounts,
+        {
+            "product_usage.csv": product_usage,
+            "support_tickets.csv": support_tickets,
+            "customer_engagement.csv": customer_engagement,
+            "customer_sentiment.csv": customer_sentiment,
+            "billing.csv": billing,
+        },
     )
 
-    output_path = (
-        OUTPUT_DIR
-        / "normalized_accounts.json"
-    )
+    # output_dir is None under --validate-only. Validation must be able to run
+    # without producing a deliverable.
+    if output_dir is not None:
+        write_normalized(normalized_accounts, output_dir)
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            normalized_accounts,
-            file,
-            indent=2,
+    return normalized_accounts, source_report
+
+
+def write_normalized(normalized_accounts, workspace):
+    """
+    Persist the normalized records through the client write gate.
+
+    This deliberately accepts a ClientWorkspace and not a path. A raw directory
+    argument here would be a second, ungated way to write to disk, which is
+    exactly the thing client isolation has to rule out.
+    """
+    if not hasattr(workspace, "write_text"):
+        raise DataValidationError(
+            f"normalize_data can only write through a ClientWorkspace; got "
+            f"{type(workspace).__name__}.",
+            "This is an internal error. Report it with the run log.",
         )
 
-    return normalized_accounts
+    return workspace.write_text(
+        NORMALIZED_FILENAME, json.dumps(normalized_accounts, indent=2)
+    )
+
+
+def build_source_report(data_dir, crm_accounts, optional_rows):
+    """
+    Record what was actually supplied, for the run manifest and warnings.
+
+    Rows referencing an account_id that is not in crm_accounts.csv are silently
+    ignored by the join above. That is the right behaviour, but it must be
+    visible, so those ids are collected here.
+    """
+    known_ids = {
+        (row.get("account_id") or "").strip()
+        for row in crm_accounts
+    }
+
+    files_present = {"crm_accounts.csv": True}
+    orphans = {}
+
+    for filename in OPTIONAL_SOURCES:
+        files_present[filename] = (Path(data_dir) / filename).exists()
+
+        rows = optional_rows.get(filename) or []
+        unmatched = {
+            (row.get("account_id") or "").strip()
+            for row in rows
+            if (row.get("account_id") or "").strip() not in known_ids
+        }
+
+        orphans[filename] = sorted(identifier for identifier in unmatched)
+
+    return {
+        "input_dir": str(data_dir),
+        "files_present": files_present,
+        "row_counts": {
+            "crm_accounts.csv": len(crm_accounts),
+            **{
+                filename: len(optional_rows.get(filename) or [])
+                for filename in OPTIONAL_SOURCES
+            },
+        },
+        "orphan_account_ids": orphans,
+    }
 
 
 if __name__ == "__main__":
-    accounts = normalize_accounts()
-
     print(
-        f"Normalized "
-        f"{len(accounts)} "
-        f"customer accounts."
-    )
-
-    print(
-        "Output written to: "
-        f"{OUTPUT_DIR / 'normalized_accounts.json'}"
+        "normalize_data is a library module in a client run.\n"
+        "Run the workflow with:\n"
+        "    uv run python main.py clients/<client-name>"
     )

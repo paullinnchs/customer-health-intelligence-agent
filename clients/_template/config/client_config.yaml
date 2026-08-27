@@ -1,0 +1,113 @@
+# =============================================================================
+# CHIA CLIENT CONFIGURATION — TEMPLATE
+# =============================================================================
+# Copy this whole directory to clients/<client-name>/ and edit the values.
+#
+#   clients/acme/
+#     config/client_config.yaml    <- this file
+#     input/                       <- the client's CSV exports
+#     outputs/                     <- created automatically; never edit by hand
+#
+# Then run:
+#
+#   uv run python main.py clients/acme --validate-only
+#   uv run python main.py clients/acme
+#
+# A client workspace INHERITS the PLS Baseline Health Model from
+# config/health_rules.yaml. It does not restate it. Only the documented
+# override paths below may be changed, and every one of them needs a rationale.
+# =============================================================================
+
+
+client:
+  # Display name. Appears on the portfolio report and in the run manifest.
+  name: "Template Client"
+
+  # MUST match this workspace's directory name exactly. A mismatch stops the
+  # run, because it is almost always a configuration copied from another
+  # client.
+  slug: "_template"
+
+  # Optional, recorded in the run manifest for delivery traceability.
+  engagement: "PLS-0000-000"
+  contact: "Name, Title"
+
+
+# -----------------------------------------------------------------------------
+# BASELINE
+# -----------------------------------------------------------------------------
+# Optional and fixed. A client cannot substitute a different health model; this
+# key exists so the inheritance is explicit on the page rather than implied.
+baseline: "config/health_rules.yaml"
+
+
+# -----------------------------------------------------------------------------
+# SLACK
+# -----------------------------------------------------------------------------
+# The webhook secret NEVER lives in this file. Name the environment variable
+# that holds it and put the URL in .env under that name. A value here that
+# looks like a URL stops the run.
+#
+#   .env:  SLACK_WEBHOOK_ACME=https://hooks.slack.com/services/...
+#
+slack:
+  enabled: false
+  webhook_env_var: null
+
+
+# -----------------------------------------------------------------------------
+# OVERRIDES
+# -----------------------------------------------------------------------------
+# The PLS methodology is locked. Health Score bands, Retention Risk mapping,
+# Signal Coverage, Revenue Exposure, expansion logic, priority routing, and
+# every scoring weight and band are NOT client-configurable.
+#
+# Exactly these paths may be overridden:
+#
+#   health_model.support_health.average_resolution_hours.bands
+#   health_model.support_health.average_resolution_hours.above_points
+#   health_model.commercial_renewal.billing_status.minor_overdue_max_days
+#   alerts.high_risk_min_arr
+#   alerts.high_risk_max_days_to_renewal
+#   alerts.known_contraction_min_arr
+#   alerts.known_expansion_min_arr
+#
+# The first three are the two calibration slots that config/health_rules.yaml
+# deliberately ships uncalibrated. Until they are set, those subcomponents are
+# reported as UNAVAILABLE and Signal Coverage reflects the gap honestly.
+#
+# The rest are Slack alert routing thresholds and do not affect any score.
+#
+# Every override requires a `rationale` recording why it was applied, who
+# approved it, and when. An override without one stops the run. Rationales are
+# reproduced in the client's run-summary.md.
+#
+# Naming any other path stops the run: an unknown path would mean inventing a
+# new scoring rule, and a known-but-locked path would mean changing the
+# methodology. Both need a written methodology change, not a config edit.
+
+overrides: []
+
+# Worked example — delete the `overrides: []` line above and uncomment:
+#
+# overrides:
+#   - path: health_model.support_health.average_resolution_hours.bands
+#     value:
+#       - { at_most: 24, points: 3 }
+#       - { at_most: 48, points: 2 }
+#       - { at_most: 72, points: 1 }
+#     rationale: >
+#       Support SLA confirmed by J. Rivera (VP Support) on 2026-08-20:
+#       P1 24h, P2 48h, P3 72h. Calibrates the 3-point Resolution
+#       Performance subcomponent, which is unavailable until set.
+#
+#   - path: alerts.high_risk_min_arr
+#     value: 100000
+#     rationale: >
+#       Portfolio ARR is materially smaller than the PLS default assumes;
+#       agreed with the client on 2026-08-21. Alert routing only.
+
+
+notes: >
+  Free-text. Anything a future operator should know before running this
+  client: export quirks, known data gaps, agreed scope.

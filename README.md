@@ -321,27 +321,93 @@ Alert counts are internal operational logging. They are deliberately not a custo
 
 ---
 
+## Client Runs
+
+A delivery run serves exactly one client. Each client gets a workspace:
+
+```text
+clients/
+  acme/
+    config/client_config.yaml     inherits the PLS baseline
+    input/                        the client's CSV exports
+    outputs/                      the delivery — the only writable location
+```
+
+Stand one up by copying the template, then validate before you run:
+
+```bash
+cp -r clients/_template clients/acme
+
+uv run python main.py clients/acme --validate-only
+uv run python main.py clients/acme
+```
+
+| Option | Effect |
+|---|---|
+| `--validate-only` | Validates the workspace, configuration, and input data, then reports. Writes nothing. |
+| `--no-ai` | Deterministic scoring and reports without narrative. No API key required. |
+| `--no-slack` | Suppresses alerts. Alerts that would have fired are still counted in the manifest. |
+| `--as-of YYYY-MM-DD` | Pins the run's effective date. Defaults to today. |
+
+Running `main.py` with no client workspace exits with usage. There is no
+default target and no fallback to `sample_data`, because an implicit target is
+how one client's data ends up in another client's report.
+
+### Client isolation
+
+Every file a run writes goes through a single write gate on the resolved
+workspace, which refuses any destination outside that client's `outputs/`
+directory. Account names from a CRM export are slugified before they touch a
+path. A run holds exactly one workspace, resolved before any I/O, so two
+clients cannot be mixed.
+
+`CUSTOMER_HEALTH_DATA_DIR` is ignored in a client run.
+
+### Configuration inheritance
+
+A client workspace inherits `config/health_rules.yaml` whole. The methodology —
+scoring weights, score bands, Retention Risk, Signal Coverage, Revenue
+Exposure, expansion logic, priority routing — is locked and not
+client-configurable.
+
+A client may override exactly seven paths, each requiring a written rationale:
+the two calibration slots the baseline deliberately ships uncalibrated
+(the resolution-time benchmark and the overdue billing boundary) and the four
+Slack alert thresholds. Any other path stops the run — an unknown path would
+mean inventing a new scoring rule, and a known but locked path would mean
+changing the methodology.
+
+See [clients/README.md](clients/README.md) for the full table.
+
+### Run metadata
+
+Every run writes `outputs/run_manifest.json` and a readable
+`outputs/run-summary.md` recording the client, run and effective dates, the
+configuration and its hash, every override with its rationale, account count,
+portfolio ARR, Signal Coverage summary, validation status, data-quality
+conditions, and a hash of every input and output file.
+
+Reproduce a delivered run with the effective date from its manifest:
+
+```bash
+uv run python main.py clients/acme --as-of 2026-08-27
+```
+
+The date has to be pinned because `days_to_renewal` is measured from it, and
+that feeds Renewal Proximity and the alert renewal window.
+
 ## Data Handling
 
 The public repository includes only sample/mock data.
 
 Never commit customer exports or customer-specific outputs.
 
-For local client work, place files in a private folder such as:
+`clients/*/input/`, `clients/*/outputs/`, `client_data/`, and `outputs/` are
+excluded from Git. Client *configuration* is tracked so a delivery can be
+reproduced, which is why a Slack webhook secret is never permitted in it — the
+configuration names an environment variable and the value stays in `.env`.
 
-```text
-client_data/
-```
-
-Then set:
-
-```text
-CUSTOMER_HEALTH_DATA_DIR=client_data
-```
-
-in your local `.env`.
-
-`client_data/` and `outputs/` are excluded from Git.
+`clients/_template/` is tracked in full; its CSVs are headers only.
 
 ---
 
@@ -369,20 +435,14 @@ Create a local `.env`:
 
 ```text
 ANTHROPIC_API_KEY=your_key_here
-SLACK_WEBHOOK_URL=optional_slack_webhook
-CUSTOMER_HEALTH_DATA_DIR=sample_data
+SLACK_WEBHOOK_ACME=optional_per_client_slack_webhook
 ```
 
-Run the normalization layer by itself:
+Run the demo workspace, which is built from a copy of `sample_data`:
 
 ```bash
-uv run python normalize_data.py
-```
-
-Run the complete workflow:
-
-```bash
-uv run python main.py
+uv run python main.py clients/demo --validate-only
+uv run python main.py clients/demo
 ```
 
 ---

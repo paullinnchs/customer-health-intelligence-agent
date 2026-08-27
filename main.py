@@ -1,36 +1,93 @@
+"""
+main.py
+-------
+The CHIA client run.
+
+    uv run python main.py clients/<client-name>
+
+One invocation serves exactly one client. The workspace is resolved and
+validated before any I/O, the PLS baseline is loaded and merged with that
+client's documented overrides, and every output is written through the
+workspace write gate into that client's outputs directory and nowhere else.
+
+The scoring engine in health_model.py is untouched by this layer. Everything
+here is orchestration, presentation, and record-keeping.
+"""
+
+import argparse
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import anthropic
 import requests
-import yaml
 from dotenv import load_dotenv
 
+import client_config
+import data_quality
 import health_model
-from normalize_data import DataValidationError, normalize_accounts
+import run_metadata
+from chia_errors import ClientRunError, ConfigError
+from client_workspace import ClientWorkspace
+from normalize_data import normalize_accounts
 
 
 load_dotenv()
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-
 MODEL = "claude-haiku-4-5-20251001"
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-CONFIG_PATH = BASE_DIR / "config" / "health_rules.yaml"
+
+USAGE = """\
+CHIA - Customer Health Intelligence Agent
+
+Usage:
+    uv run python main.py <client-workspace> [options]
+
+Example:
+    uv run python main.py clients/acme
+
+Options:
+    --validate-only     Validate the workspace, configuration, and input data.
+                        Writes nothing. Use this before every client delivery.
+    --no-ai             Skip narrative generation. Deterministic scoring and
+                        reports only. No ANTHROPIC_API_KEY required.
+    --no-slack          Suppress Slack alerts. Alerts that would have fired
+                        are still counted and recorded in the run manifest.
+    --as-of YYYY-MM-DD  Pin the run's effective date. Defaults to today.
+                        Use the effective_date from a run manifest to
+                        reproduce that run exactly.
+
+A client workspace is a directory containing:
+
+    config/client_config.yaml
+    input/crm_accounts.csv          (plus any optional signal exports)
+    outputs/                        (created automatically)
+
+clients/_template is a documented starting point.
+"""
 
 
-def load_health_rules():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as file:
-        return yaml.safe_load(file)
+def build_anthropic_client():
+    """
+    Create the narrative client.
 
+    Deferred until a narrative is actually needed so that --validate-only and
+    --no-ai runs do not require an API key.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
 
-HEALTH_RULES = load_health_rules()
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    if not api_key:
+        raise ConfigError(
+            "ANTHROPIC_API_KEY is not set, so the AI narrative cannot be "
+            "generated.",
+            "Add ANTHROPIC_API_KEY to your .env file, or run with --no-ai to "
+            "produce deterministic scoring and reports without narrative.",
+        )
+
+    return anthropic.Anthropic(api_key=api_key)
 
 
 def clean_json_text(text):
@@ -120,7 +177,7 @@ def build_scoring_context(health):
     return "\n".join(lines)
 
 
-def analyze_account_narrative(account, health):
+def analyze_account_narrative(account, health, narrative_client):
     """
     Ask the LLM for interpretation only.
 
@@ -234,7 +291,7 @@ CUSTOMER ACCOUNT DATA
 {account_json}
 """
 
-    response = client.messages.create(
+    response = narrative_client.messages.create(
         model=MODEL,
         max_tokens=1000,
         messages=[
@@ -320,13 +377,17 @@ def build_account_result(account, health, narrative):
     return result
 
 
-def get_priority_group(account, result):
+def get_priority_group(account, result, health_rules):
     """
     Primary attention routing.
 
     Three mutually exclusive groups. Expansion is deliberately not one of them.
+
+    The rules arrive as an argument rather than a module global so a run always
+    routes against its own client's resolved configuration. The routing logic
+    itself is unchanged and is not client-configurable.
     """
-    priority_rules = HEALTH_RULES["priority_routing"]
+    priority_rules = health_rules["priority_routing"]
 
     if (
         result["retention_risk"]
@@ -351,8 +412,8 @@ def get_priority_group(account, result):
     return "Healthy / No Immediate Action"
 
 
-def should_alert(account, result):
-    alert_rules = HEALTH_RULES["alerts"]
+def should_alert(account, result, health_rules):
+    alert_rules = health_rules["alerts"]
 
     days_to_renewal = account.get("days_to_renewal")
     within_renewal_window = (
@@ -409,20 +470,11 @@ def render_score_breakdown(result):
     return "\n".join(rows)
 
 
-def save_markdown_report(account, result):
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    filename = (
-        account["account_name"]
-        .lower()
-        .replace(" ", "-")
-        + "-health-intelligence.md"
-    )
-
-    path = OUTPUT_DIR / filename
+def save_markdown_report(account, result, workspace):
+    # The filename is derived from a CRM-supplied account name, so it is
+    # slugified and written through the workspace gate. A name containing a
+    # path separator cannot steer this write out of the client's outputs.
+    filename = workspace.report_filename(account["account_name"])
 
     usage = account["product_usage"]
     support = account["support"]
@@ -550,21 +602,18 @@ Health Score is the points earned across available signals, normalized to 100. S
 - **AI contribution:** Health Summary, Risk Drivers, Positive Signals, Expansion Evidence, and Recommended Next Step are AI-assisted interpretation of the evidence above.
 """
 
-    path.write_text(
-        content,
-        encoding="utf-8",
-    )
+    path = workspace.write_text(filename, content)
 
     print(f"Saved report: {path}")
 
 
-def send_slack_alert(account, result):
-    if not SLACK_WEBHOOK_URL:
+def send_slack_alert(account, result, webhook_url):
+    if not webhook_url:
         print(
             "Slack webhook missing. "
             "Skipping alert."
         )
-        return
+        return False
 
     if result["risk_drivers"]:
         attention_details = chr(10).join(
@@ -630,23 +679,35 @@ def send_slack_alert(account, result):
 ━━━━━━━━━━
 """
 
-    response = requests.post(
-        SLACK_WEBHOOK_URL,
-        json={"text": message},
-        timeout=10,
-    )
+    try:
+        response = requests.post(
+            webhook_url,
+            json={"text": message},
+            timeout=10,
+        )
+    except requests.RequestException as error:
+        # Alerting is a notification channel, not a result. A Slack outage
+        # must not lose a portfolio that has already been scored.
+        print(
+            f"Slack request failed for "
+            f"{account['account_name']}: {error}"
+        )
+        return False
 
     if response.status_code == 200:
         print(
             f"Slack alert sent for "
             f"{account['account_name']}."
         )
-    else:
-        print(
-            "Slack error:",
-            response.status_code,
-            response.text,
-        )
+        return True
+
+    print(
+        "Slack error:",
+        response.status_code,
+        response.text,
+    )
+
+    return False
 
 
 def summarize_reason(result):
@@ -662,12 +723,13 @@ def summarize_reason(result):
     return result["health_summary"]
 
 
-def generate_portfolio_summary(portfolio_results):
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+def generate_portfolio_summary(
+    portfolio_results,
+    workspace,
+    health_rules,
+    client_name,
+    effective_date,
+):
     total_accounts = len(portfolio_results)
 
     total_arr = sum(
@@ -729,6 +791,7 @@ def generate_portfolio_summary(portfolio_results):
         group = get_priority_group(
             item["account"],
             item["result"],
+            health_rules,
         )
 
         item["priority_group"] = group
@@ -746,9 +809,13 @@ def generate_portfolio_summary(portfolio_results):
         "%m/%d/%Y %I:%M %p"
     )
 
+    # The client is named on the deliverable so a portfolio report can never be
+    # filed against the wrong account when it leaves this repository.
     content = f"""# Customer Health Intelligence Audit — Portfolio Summary
 
+**Client:** {client_name}
 **Generated:** {generated_date}
+**Effective Date:** {effective_date}
 
 ## Portfolio Snapshot
 
@@ -897,14 +964,9 @@ def generate_portfolio_summary(portfolio_results):
 - **Known Contraction / Expansion:** Commercial amounts explicitly present in source data. These are not AI-generated estimates.
 """
 
-    output_path = (
-        OUTPUT_DIR
-        / "portfolio-health-summary.md"
-    )
-
-    output_path.write_text(
+    output_path = workspace.write_text(
+        "portfolio-health-summary.md",
         content,
-        encoding="utf-8",
     )
 
     return {
@@ -1042,143 +1104,399 @@ def print_portfolio_summary(summary, slack_alert_count, narrative_failures):
     print("=" * 64)
 
 
-def main():
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Add it to your .env file before running."
-        )
+# ---------------------------------------------------------------------------
+# Client run
+# ---------------------------------------------------------------------------
 
-    print(
-        "ANTHROPIC KEY LOADED:",
-        bool(ANTHROPIC_API_KEY),
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        add_help=False,
+        usage=argparse.SUPPRESS,
     )
-
-    print(
-        "SLACK WEBHOOK LOADED:",
-        bool(SLACK_WEBHOOK_URL),
-    )
-
-    print(
-        "\nConsolidating customer data "
-        "from source systems..."
-    )
+    parser.add_argument("client", nargs="?")
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--no-ai", action="store_true")
+    parser.add_argument("--no-slack", action="store_true")
+    parser.add_argument("--as-of")
+    parser.add_argument("-h", "--help", action="store_true", dest="help")
 
     try:
-        accounts = normalize_accounts()
-    except DataValidationError as error:
-        print("\nData validation failed.\n")
-        print(error)
-        raise SystemExit(1)
+        args = parser.parse_args(argv)
+    except SystemExit:
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2) from None
+
+    if args.help:
+        print(USAGE)
+        raise SystemExit(0)
+
+    # D4: a run without an explicit client workspace exits with usage. There is
+    # deliberately no default and no fallback to sample_data, because an
+    # implicit target is how one client's data ends up in another's report.
+    if not args.client:
+        print(USAGE, file=sys.stderr)
+        print(
+            "Error: no client workspace given. CHIA will not guess which "
+            "client to run.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    return args
+
+
+def resolve_effective_date(raw):
+    """
+    The date all day-arithmetic is measured from.
+
+    Returned at midnight so a run is reproducible: `days_to_renewal` is a whole
+    number of calendar days from this date, not from the moment the run
+    happened to start.
+    """
+    if not raw:
+        today = datetime.today()
+        return (
+            datetime(today.year, today.month, today.day),
+            "defaulted to today",
+        )
+
+    try:
+        parsed = datetime.strptime(raw.strip(), "%Y-%m-%d")
+    except ValueError:
+        raise ConfigError(
+            f"--as-of must be a date in YYYY-MM-DD format; got {raw!r}.",
+            "For example: --as-of 2026-08-27",
+        ) from None
+
+    return parsed, "pinned with --as-of"
+
+
+def resolve_slack_webhook(client, no_slack):
+    """
+    Per-client Slack routing.
+
+    D6: the client configuration names an environment variable; the webhook
+    itself only ever lives in .env. Returns (webhook_url, reason_if_disabled).
+    """
+    if no_slack:
+        return None, "suppressed with --no-slack"
+
+    slack = client["slack"]
+
+    if not slack["enabled"]:
+        return None, "not enabled in client configuration"
+
+    webhook = os.getenv(slack["webhook_env_var"])
+
+    if not webhook:
+        return None, (
+            f"environment variable {slack['webhook_env_var']} is not set"
+        )
+
+    return webhook, None
+
+
+def print_run_header(workspace, client, effective_date, date_source, flags):
+    print("=" * 64)
+    print("CUSTOMER HEALTH INTELLIGENCE — CLIENT RUN")
+    print("=" * 64)
+    print(f"Client:          {client['name']}")
+    print(f"Workspace:       {workspace.display_root()}")
+    print(f"Input:           {workspace.input_dir}")
+    print(f"Outputs:         {workspace.outputs_dir}")
+    print(
+        f"Effective Date:  {effective_date.strftime('%Y-%m-%d')} "
+        f"({date_source})"
+    )
+
+    if client["overrides"]:
+        print(f"Overrides:       {len(client['overrides'])} applied")
+        for entry in client["overrides"]:
+            print(f"                 - {entry['path']}")
+    else:
+        print("Overrides:       none (PLS baseline)")
+
+    active = [name for name, on in flags.items() if on]
+    print(f"Mode:            {', '.join(active) if active else 'full run'}")
+    print("=" * 64)
+
+
+def run(args):
+    started_at = datetime.now()
+
+    # 1-3. Identify the workspace and confirm it can be read. Nothing is
+    # written and no configuration is loaded until this succeeds.
+    workspace = ClientWorkspace.resolve(args.client)
+
+    if os.getenv("CUSTOMER_HEALTH_DATA_DIR"):
+        print(
+            "Note: CUSTOMER_HEALTH_DATA_DIR is set in the environment and is "
+            "ignored in a client run.\n"
+            f"      Input is read from {workspace.input_dir}\n"
+        )
+
+    # 4-5. PLS baseline, then documented client overrides. Any override naming
+    # an unknown or locked path stops the run here.
+    baseline_path = client_config.CANONICAL_BASELINE
+    baseline_rules = client_config.load_baseline_rules(baseline_path)
+    client = client_config.load_client_config(workspace, baseline_rules)
+    health_rules = client_config.resolve_health_rules(
+        baseline_rules, client["overrides"]
+    )
+
+    effective_date, date_source = resolve_effective_date(args.as_of)
+
+    print_run_header(
+        workspace,
+        client,
+        effective_date,
+        date_source,
+        {
+            "validate-only": args.validate_only,
+            "no-ai": args.no_ai,
+            "no-slack": args.no_slack,
+        },
+    )
+
+    # 6. Normalize. Validation of required fields and dates happens inside and
+    # raises before any output is produced.
+    print("\nConsolidating customer data from source systems...")
+
+    accounts, source_report = normalize_accounts(
+        input_dir=workspace.input_dir,
+        output_dir=None if args.validate_only else workspace,
+        as_of=effective_date,
+    )
 
     print(
-        f"Created {len(accounts)} "
-        "normalized account health records."
+        f"Created {len(accounts)} normalized account health records."
+    )
+
+    narrative_client = None
+
+    if not args.validate_only and not args.no_ai:
+        narrative_client = build_anthropic_client()
+
+    webhook, slack_disabled_reason = resolve_slack_webhook(
+        client, args.no_slack or args.validate_only
     )
 
     portfolio_results = []
     slack_alert_count = 0
+    slack_suppressed_count = 0
     narrative_failures = 0
 
+    # 7-9. Deterministic scoring first, then narrative, then outputs.
     for account in accounts:
-        print(
-            f"\nAnalyzing: "
-            f"{account['account_name']}"
-        )
+        print(f"\nAnalyzing: {account['account_name']}")
 
-        health = health_model.score_account(
-            account,
-            HEALTH_RULES,
-        )
+        health = health_model.score_account(account, health_rules)
 
-        narrative = analyze_account_narrative(
-            account,
-            health,
-        )
+        narrative = None
 
-        # The score is deterministic, so a narrative failure must not drop the
+        if narrative_client is not None:
+            narrative = analyze_account_narrative(
+                account, health, narrative_client
+            )
+
+        narrative_available = narrative is not None
+
+        # The score is deterministic, so a missing narrative must not drop the
         # account out of the portfolio and skew the totals.
         if narrative is None:
-            narrative_failures += 1
+            if narrative_client is not None:
+                narrative_failures += 1
+                print("Proceeding with deterministic results only.")
+
             narrative = empty_narrative()
             narrative["health_summary"] = (
-                "Narrative generation was unavailable for this account. "
+                "Narrative generation was not performed for this account. "
+                "The deterministic scoring results below are unaffected."
+                if args.no_ai or args.validate_only
+                else "Narrative generation was unavailable for this account. "
                 "The deterministic scoring results below are unaffected."
             )
-            print(
-                "Proceeding with deterministic results only."
-            )
 
-        result = build_account_result(
-            account,
-            health,
-            narrative,
-        )
+        result = build_account_result(account, health, narrative)
+        result["narrative_available"] = narrative_available
 
         print(
             "Health:",
-            f"{result['health_score']}/100 - "
-            f"{result['health_status']}",
+            f"{result['health_score']}/100 - {result['health_status']}",
+        )
+        print("Retention Risk:", result["retention_risk"])
+        print("Signal Coverage:", f"{result['signal_coverage_pct']}%")
+        print("Revenue Exposure:", f"${result['revenue_exposure']:,.0f}")
+        print("Known Contraction:", f"${result['known_contraction']:,.0f}")
+        print("Known Expansion:", f"${result['known_expansion']:,.0f}")
+
+        if not args.validate_only:
+            save_markdown_report(account, result, workspace)
+
+        portfolio_results.append({"account": account, "result": result})
+
+        if should_alert(account, result, health_rules):
+            if webhook:
+                if send_slack_alert(account, result, webhook):
+                    slack_alert_count += 1
+                else:
+                    slack_suppressed_count += 1
+            else:
+                slack_suppressed_count += 1
+
+    warnings = data_quality.collect(
+        accounts, portfolio_results, health_rules, source_report
+    )
+    warning_summary = data_quality.summarize(warnings)
+
+    if args.validate_only:
+        return report_validation_only(
+            workspace,
+            client,
+            accounts,
+            portfolio_results,
+            warnings,
+            warning_summary,
+            effective_date,
+            date_source,
         )
 
+    # 10. Portfolio outputs, all through the workspace write gate.
+    summary = generate_portfolio_summary(
+        portfolio_results,
+        workspace,
+        health_rules,
+        client["name"],
+        effective_date.strftime("%Y-%m-%d"),
+    )
+
+    resolved_config_text = client_config.dump_resolved_rules(
+        health_rules, client, client["overrides"], baseline_path
+    )
+    workspace.write_text(
+        run_metadata.RESOLVED_CONFIG_FILENAME, resolved_config_text
+    )
+
+    print_portfolio_summary(summary, slack_alert_count, narrative_failures)
+
+    if slack_disabled_reason and slack_suppressed_count:
         print(
-            "Retention Risk:",
-            result["retention_risk"],
+            f"[internal] Slack alerts not sent: {slack_suppressed_count} "
+            f"({slack_disabled_reason})"
         )
 
-        print(
-            "Signal Coverage:",
-            f"{result['signal_coverage_pct']}%",
-        )
+    print("\nData Quality")
+    print(data_quality.render_console(warnings))
 
-        print(
-            "Revenue Exposure:",
-            f"${result['revenue_exposure']:,.0f}",
-        )
+    # 11. Run metadata, written last so it can record every other output.
+    manifest = run_metadata.build(
+        workspace=workspace,
+        client=client,
+        baseline_path=baseline_path,
+        resolved_config_text=resolved_config_text,
+        scored=portfolio_results,
+        portfolio=summary,
+        warnings=warnings,
+        warning_summary=warning_summary,
+        started_at=started_at,
+        effective_date=effective_date,
+        flags={
+            "command": " ".join(["main.py"] + sys.argv[1:]),
+            "validate_only": args.validate_only,
+            "no_ai": args.no_ai,
+            "no_slack": args.no_slack,
+            "as_of": args.as_of,
+            "as_of_source": date_source,
+        },
+        model=MODEL if narrative_client is not None else None,
+        narrative_failures=narrative_failures,
+        alerts_sent=slack_alert_count,
+        alerts_suppressed=slack_suppressed_count,
+        validation_status="passed",
+    )
 
-        print(
-            "Known Contraction:",
-            f"${result['known_contraction']:,.0f}",
-        )
+    manifest_path = run_metadata.write(workspace, manifest)
 
-        print(
-            "Known Expansion:",
-            f"${result['known_expansion']:,.0f}",
-        )
+    print(f"\nRun manifest:             {manifest_path}")
+    print(f"Outputs written:          {len(workspace.written_files)}")
+    print(f"All outputs confined to:  {workspace.outputs_dir}")
 
-        save_markdown_report(
-            account,
-            result,
-        )
+    return 0
 
-        portfolio_results.append(
-            {
-                "account": account,
-                "result": result,
-            }
-        )
 
-        if should_alert(
-            account,
-            result,
-        ):
-            send_slack_alert(
-                account,
-                result,
-            )
+def report_validation_only(
+    workspace,
+    client,
+    accounts,
+    portfolio_results,
+    warnings,
+    warning_summary,
+    effective_date,
+    date_source,
+):
+    """
+    --validate-only: prove the run would succeed, write nothing.
 
-            slack_alert_count += 1
+    Scoring is executed because a configuration that cannot score an account is
+    a real defect, and it is better found here than during a delivery.
+    """
+    coverages = [
+        item["result"]["signal_coverage_pct"] for item in portfolio_results
+    ]
 
-    if portfolio_results:
-        summary = generate_portfolio_summary(
-            portfolio_results
-        )
+    print("\n")
+    print("=" * 64)
+    print("VALIDATION PASSED - NO FILES WRITTEN")
+    print("=" * 64)
+    print(f"Client:                   {client['name']}")
+    print(f"Accounts validated:       {len(accounts)}")
+    print(
+        f"Portfolio ARR:            "
+        f"${sum(a['arr'] for a in accounts):,.0f}"
+    )
+    print(
+        f"Average Signal Coverage:  "
+        f"{round(sum(coverages) / len(coverages), 1)}%"
+    )
+    print(
+        f"Signal Coverage range:    "
+        f"{min(coverages)}% to {max(coverages)}%"
+    )
+    print(f"Effective date:           {effective_date:%Y-%m-%d} ({date_source})")
+    print(
+        f"Overrides applied:        "
+        f"{len(client['overrides'])}"
+    )
+    print(
+        f"Data-quality conditions:  {warning_summary['total']} "
+        f"({warning_summary['warnings']} warning, "
+        f"{warning_summary['info']} info)"
+    )
+    print("")
+    print(data_quality.render_console(warnings))
+    print("=" * 64)
+    print(
+        "Nothing was written. Re-run without --validate-only to produce the "
+        "client deliverable."
+    )
 
-        print_portfolio_summary(
-            summary,
-            slack_alert_count,
-            narrative_failures,
-        )
+    return 0
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    try:
+        return run(args)
+    except ClientRunError as error:
+        print("\n" + "=" * 64, file=sys.stderr)
+        print(error.render(), file=sys.stderr)
+        print("=" * 64, file=sys.stderr)
+        print("\nNo further outputs were produced.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+

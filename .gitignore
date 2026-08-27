@@ -4,11 +4,21 @@ __pycache__/
 *.pyc
 *.log
 
-# Generated outputs
+# Generated outputs (matches the repo root and every client workspace)
 outputs/
 
 # Never commit customer/client exports
 client_data/
+
+# Client workspaces hold real customer data. Inputs and outputs are excluded
+# for every client; the configuration is kept so a delivery is reproducible.
+clients/*/input/
+clients/*/outputs/
+
+# The template workspace is schema documentation with header-only CSVs and no
+# customer data, so it is deliberately tracked.
+!clients/_template/input/
+!clients/_template/input/*.csv
 
 # Local OS/editor artifacts
 .DS_Store
