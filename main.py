@@ -130,6 +130,291 @@ def empty_narrative():
     }
 
 
+def _num(value):
+    """Render a numeric signal value without a trailing .0."""
+    if value is None:
+        return "not available"
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value)
+
+
+def _signed(value):
+    """Render a change value so the direction is unambiguous."""
+    if value is None:
+        return "not available"
+
+    return f"+{_num(value)}" if value > 0 else _num(value)
+
+
+def _words(value):
+    """Render a source-data enum as readable text without reinterpreting it."""
+    return str(value).replace("_", " ")
+
+
+# One fact-only sentence per scored signal, keyed by the (component,
+# subcomponent) keys in config/health_rules.yaml rather than by display label,
+# so relabelling a signal in configuration does not silently drop its evidence.
+# Each sentence states source data only: no cause, commitment, SLA, intent, or
+# commercial status is inferred.
+SIGNAL_SENTENCES = {
+    ("product_adoption", "license_utilization_pct"): lambda a: (
+        f"License utilization is "
+        f"{_num(a['product_usage']['license_utilization_pct'])}%."
+    ),
+    ("product_adoption", "login_change_60d_pct"): lambda a: (
+        f"The 60-day login change is "
+        f"{_signed(a['product_usage']['login_change_60d_pct'])}%."
+    ),
+    ("product_adoption", "core_feature_adoption_pct"): lambda a: (
+        f"Core feature adoption is "
+        f"{_num(a['product_usage']['core_feature_adoption_pct'])}%."
+    ),
+    ("product_adoption", "automation_adoption_pct"): lambda a: (
+        f"Automation and advanced feature adoption is "
+        f"{_num(a['product_usage']['automation_adoption_pct'])}%."
+    ),
+    ("customer_engagement", "days_since_last_csm_meeting"): lambda a: (
+        f"The last CSM meeting was "
+        f"{_num(a['engagement']['days_since_last_csm_meeting'])} days ago."
+    ),
+    ("customer_engagement", "days_since_last_exec_meeting"): lambda a: (
+        f"The last executive meeting was "
+        f"{_num(a['engagement']['days_since_last_exec_meeting'])} days ago."
+    ),
+    ("customer_engagement", "qbr_completed"): lambda a: (
+        "A QBR has been completed."
+        if a["engagement"]["qbr_completed"]
+        else "No QBR has been completed."
+    ),
+    ("customer_engagement", "champion_status"): lambda a: (
+        f"Champion status is recorded as "
+        f"{_words(a['engagement']['champion_status'])}."
+    ),
+    ("customer_engagement", "stakeholder_coverage"): lambda a: (
+        f"Stakeholder coverage is recorded as "
+        f"{_words(a['engagement']['stakeholder_coverage'])}."
+    ),
+    ("customer_engagement", "open_action_items"): lambda a: (
+        f"Open action items recorded: "
+        f"{_num(a['engagement']['open_action_items'])}."
+    ),
+    ("customer_sentiment", "current_nps"): lambda a: (
+        f"Current NPS is {_num(a['sentiment']['current_nps'])}."
+    ),
+    ("customer_sentiment", "nps_change"): lambda a: (
+        f"NPS changed by {_signed(a['sentiment']['nps_change'])} points."
+    ),
+    ("customer_sentiment", "sentiment"): lambda a: (
+        f"Recorded customer sentiment is {_words(a['sentiment']['sentiment'])}."
+        + (
+            f" Customer feedback: {a['sentiment']['primary_feedback']}"
+            if a["sentiment"].get("primary_feedback") not in (None, "")
+            else ""
+        )
+    ),
+    ("support_health", "high_severity_tickets"): lambda a: (
+        f"High-severity tickets recorded: "
+        f"{_num(a['support']['high_severity_tickets'])}."
+    ),
+    ("support_health", "open_tickets"): lambda a: (
+        f"Tickets currently open: {_num(a['support']['open_tickets'])}."
+    ),
+    ("support_health", "average_csat"): lambda a: (
+        f"Average CSAT is {_num(a['support']['average_csat'])}."
+    ),
+    ("support_health", "average_resolution_hours"): lambda a: (
+        f"Average resolution time is "
+        f"{_num(a['support']['average_resolution_hours'])} hours."
+    ),
+    ("commercial_renewal", "known_contraction"): lambda a: (
+        f"Known contraction of "
+        f"{money(float(a['billing']['contraction_arr'] or 0))} is recorded in "
+        f"the source data."
+        if float(a["billing"]["contraction_arr"] or 0) > 0
+        else "No known contraction is recorded in the source data."
+    ),
+    ("commercial_renewal", "billing_status"): lambda a: (
+        "Billing is current with 0 days past due."
+        if (a["billing"]["days_past_due"] or 0) <= 0
+        else f"Billing is {_num(a['billing']['days_past_due'])} days past due."
+    ),
+    ("commercial_renewal", "renewal_proximity"): lambda a: (
+        f"The account is {_num(a['days_to_renewal'])} days from renewal on "
+        f"{format_date(a['renewal_date'])}."
+    ),
+}
+
+
+def _signal_outcome_range(rule):
+    """
+    The worst and best point outcomes the configuration allows for one signal.
+
+    Derived entirely from the configured scoring rules in health_rules.yaml. No
+    new threshold is introduced here: "best" is the top configured outcome for
+    that signal and "worst" is the bottom configured outcome.
+    """
+    outcomes = [band["points"] for band in (rule.get("bands") or [])]
+
+    for key in (
+        "below_points",
+        "above_points",
+        "true_points",
+        "false_points",
+        "none_points",
+        "any_points",
+        "current_points",
+        "minor_overdue_points",
+        "materially_overdue_points",
+    ):
+        if rule.get(key) is not None:
+            outcomes.append(rule[key])
+
+    outcomes.extend((rule.get("values") or {}).values())
+
+    if not outcomes:
+        return None, None
+
+    return min(outcomes), max(outcomes)
+
+
+def _signal_rules_by_label(component_rules):
+    """Map a component's subcomponent labels back to their configured rules."""
+    return {
+        rule["label"]: (key, rule)
+        for key, rule in component_rules.items()
+        if isinstance(rule, dict) and "label" in rule
+    }
+
+
+def classify_signals(account, health, health_rules):
+    """
+    Sort the individual scored signals into adverse, positive, and neutral.
+
+    Categorization is per signal, never per component. A component that loses a
+    single point does not make its other signals adverse.
+
+    Using the configured scoring rules and nothing else:
+
+        earned at the signal's best configured outcome  -> Positive Signal
+        earned at the signal's worst configured outcome -> Risk Driver
+        anything in between                             -> neither
+
+    Neutral signals are not forced into either list. They remain visible in
+    Underlying Customer Signals. Unavailable signals are never categorized,
+    because missing data is not an adverse fact.
+    """
+    model_rules = health_rules["health_model"]
+
+    risk_drivers = []
+    positive_signals = []
+
+    for component in health["components"]:
+        component_rules = model_rules.get(component["key"], {})
+        rules_by_label = _signal_rules_by_label(component_rules)
+
+        for item in component["subcomponents"]:
+            if not item["available"]:
+                continue
+
+            entry = rules_by_label.get(item["label"])
+
+            if entry is None:
+                continue
+
+            rule_key, rule = entry
+            sentence_for = SIGNAL_SENTENCES.get((component["key"], rule_key))
+            worst, best = _signal_outcome_range(rule)
+
+            if sentence_for is None or worst is None:
+                continue
+
+            sentence = sentence_for(account)
+
+            if item["earned"] >= best:
+                positive_signals.append(sentence)
+            elif item["earned"] <= worst:
+                risk_drivers.append(sentence)
+
+    return risk_drivers, positive_signals
+
+
+def build_deterministic_narrative(account, health, health_rules):
+    """
+    Build all factual narrative sections from deterministic data only.
+
+    Risk Drivers and Positive Signals are individual signals categorized by
+    classify_signals against the configured scoring rules. The wording contains
+    source facts only; it does not invent a cause, commitment, SLA, or
+    commercial status. Known Contraction never appears as Expansion Evidence.
+    """
+    risk_drivers, positive_signals = classify_signals(
+        account, health, health_rules
+    )
+
+    billing = account.get("billing", {})
+    expansion = billing.get("expansion_arr")
+
+    if expansion is not None and float(expansion or 0) > 0:
+        expansion_evidence = [
+            f"Known expansion of {money(float(expansion))} is recorded in the source data."
+        ]
+    else:
+        expansion_evidence = ["No current expansion evidence"]
+
+    risk_labels = [
+        item["label"]
+        for component in health["components"]
+        for item in component["subcomponents"]
+        if item["available"] and item["earned"] < item["possible"]
+    ]
+
+    summary = (
+        f"{account['account_name']} is {health['health_status']} with "
+        f"{health['retention_risk']} retention risk and a Health Score of "
+        f"{health['health_score']}/100. "
+    )
+
+    days = account.get("days_to_renewal")
+    if days is not None:
+        summary += f"The account is {days} days from renewal. "
+
+    if risk_labels:
+        summary += "The scored signals below full available points are: " + ", ".join(risk_labels) + ". "
+    else:
+        summary += "All available scored signals earned their full available points. "
+
+    contraction = billing.get("contraction_arr")
+    if contraction is not None and float(contraction or 0) > 0:
+        summary += (
+            f"Known contraction of {money(float(contraction))} is recorded in the source data. "
+        )
+
+    if expansion is not None and float(expansion or 0) > 0:
+        summary += (
+            f"Known expansion of {money(float(expansion))} is recorded in the source data. "
+        )
+
+    if health["signal_coverage_pct"] < 100:
+        unavailable = "; ".join(health.get("unavailable_signals", []))
+        summary += (
+            f"Signal Coverage is {health['signal_coverage_pct']}%."
+            + (f" Unavailable signals: {unavailable}." if unavailable else "")
+        )
+    else:
+        summary += "Signal Coverage is 100%."
+
+    return {
+        "health_summary": summary.strip(),
+        "risk_drivers": risk_drivers,
+        "positive_signals": positive_signals,
+        "expansion_evidence": expansion_evidence,
+        "recommended_next_step": "",
+    }
+
+
 def build_scoring_context(health):
     """
     A compact, readable view of the deterministic results for the LLM.
@@ -177,123 +462,109 @@ def build_scoring_context(health):
     return "\n".join(lines)
 
 
-def analyze_account_narrative(account, health, narrative_client):
+def build_support_fact_context(account):
     """
-    Ask the LLM for interpretation only.
+    Present the support ticket counts as the separate facts they are.
 
-    Scores, statuses, risk levels, and dollar figures are all determined before
-    this call and passed in as context.
+    The normalized record carries a high-severity count and an open count. It
+    does not carry the overlap between them, so the two are handed to the model
+    as independent facts with the gap stated explicitly.
     """
-    account_json = json.dumps(account, indent=2)
+    support = account.get("support", {})
+    high_severity = support.get("high_severity_tickets")
+    open_tickets = support.get("open_tickets")
+
+    if high_severity is None and open_tickets is None:
+        return []
+
+    lines = ["", "INDEPENDENT SUPPORT TICKET COUNTS"]
+
+    if high_severity is not None:
+        lines.append(f"- High-severity tickets recorded: {high_severity}")
+
+    if open_tickets is not None:
+        lines.append(f"- Tickets currently open: {open_tickets}")
+
+    lines.append(
+        "- These are two separate counts of the same ticket population. The "
+        "source data does not state how many of the open tickets are high "
+        "severity, or how many of the high-severity tickets are still open. "
+        "The overlap is unknown."
+    )
+
+    return lines
+
+
+def analyze_account_narrative(account, health, deterministic_narrative, narrative_client):
+    """
+    Ask the LLM for one thing only: the recommended next step.
+
+    All facts, evidence lists, scores, classifications, and commercial figures
+    are already determined before this call.
+    """
     scoring_context = build_scoring_context(health)
+    evidence_context = "\n".join(
+        [
+            "DETERMINISTIC HEALTH SUMMARY",
+            deterministic_narrative["health_summary"],
+            "",
+            "DETERMINISTIC RISK DRIVERS",
+            *[f"- {item}" for item in deterministic_narrative["risk_drivers"]],
+            "",
+            "DETERMINISTIC POSITIVE SIGNALS",
+            *[f"- {item}" for item in deterministic_narrative["positive_signals"]],
+            "",
+            "DETERMINISTIC EXPANSION EVIDENCE",
+            *[f"- {item}" for item in deterministic_narrative["expansion_evidence"]],
+            *build_support_fact_context(account),
+        ]
+    )
 
     prompt = f"""
 You are a senior Customer Success Revenue Intelligence analyst.
 
-The customer's Health Score, Health Status, Retention Risk, and Signal
-Coverage have ALREADY been calculated deterministically by the PLS Baseline
-Health Model. Those results are given to you below and are final.
+Everything factual below has already been calculated and written
+deterministically. Your only job is to recommend the next Customer Success
+action. Do not rewrite the evidence and do not add new customer facts.
 
-Your job is interpretation and narrative only. Explain what the evidence
-means and what should happen next.
-
-Return ONLY valid raw JSON.
-No markdown.
-No explanation outside the JSON.
-
-Use this exact structure:
+Return ONLY valid raw JSON using exactly this structure:
 
 {{
-  "health_summary": "concise explanation of the customer's current condition",
-  "risk_drivers": [
-    "specific evidence-based risk driver"
-  ],
-  "positive_signals": [
-    "specific evidence-based positive signal"
-  ],
-  "expansion_evidence": [
-    "specific evidence supporting expansion, or No current expansion evidence"
-  ],
-  "recommended_next_step": "specific Customer Success action based on the evidence"
+  "recommended_next_step": "one concise, practical Customer Success action"
 }}
 
 HARD BOUNDARIES
 
-- Do NOT output a health score, health status, retention risk, churn risk, or
-  any numeric rating of your own. Those are already decided.
-- Do NOT calculate, estimate, or predict revenue loss.
-- Do NOT invent contraction or expansion dollar amounts. Commercial figures
-  come only from the source data.
-- Do NOT contradict, re-rank, or argue with the deterministic classifications.
-  If the evidence looks mixed, explain the tension instead.
-- Do NOT infer facts that are not in the source data or the scoring results.
-- CSAT is reported on the client's own survey scale, which is not stated in the
-  data. Quote the value on its own ("average CSAT of 2.4") and never state or
-  imply a denominator. Do not write "2.4/10", "2.4/5", or "2.4 out of 10".
-- High-severity ticket count and open ticket count are separate, independent
-  figures. A high-severity ticket is not necessarily open and an open ticket is
-  not necessarily high-severity. Never merge them into one claim such as
-  "three high-severity tickets remain open" unless both counts support it.
-
-HEALTH SUMMARY
-
-- Explain the customer's current condition in a few sentences.
-- Reference the deterministic results where it helps the reader understand why
-  the account sits where it does.
-- If Signal Coverage is below 100%, note which signals were unavailable when
-  that materially limits the picture.
-
-RISK DRIVERS
-
-- Identify the most important negative signals behind the assessment.
-- Every risk driver must be traceable to the account data or to a low-scoring
-  component in the results above.
-- Be specific and quantify wherever possible.
-- Example: "Product logins declined 31% over 60 days" is better than
-  "Usage is declining."
-
-POSITIVE SIGNALS
-
-- Identify evidence supporting retention, adoption, customer value, or
-  stability.
-- Every positive signal must be traceable to the provided data or results.
-- Include positive signals even for unhealthy accounts when they exist.
-
-EXPANSION EVIDENCE
-
-- Report expansion signals only when supported by the source data.
-- Known Expansion in the billing data is a confirmed commercial fact; treat it
-  as such and do not restate it as a dollar estimate of your own.
-- Additional supporting evidence may include increasing usage, strong
-  adoption, positive sentiment, or stakeholder engagement.
-- Expansion is assessed independently of retention risk. An at-risk account
-  can still carry a genuine expansion opportunity; say so if the evidence
-  supports it.
-- If there is no meaningful expansion evidence, say
-  "No current expansion evidence."
-
-RECOMMENDED NEXT STEP
-
-- Recommend one clear Customer Success action.
-- Use professional Customer Success language.
-- Avoid terms such as "emergency" unless the source data explicitly indicates
-  a confirmed cancellation or non-renewal decision.
-- For high-risk accounts, prefer language such as executive intervention,
-  recovery plan, renewal risk review, or success plan.
+- Use only the deterministic facts below.
+- Do not invent or infer contractual commitments, SLAs, cancellation intent,
+  renewal intent, root causes, or customer decisions.
+- High-severity ticket count and open-ticket count are independent facts. Their
+  overlap is unknown unless the source data explicitly establishes it.
+- Never describe open tickets as high-severity merely because both counts exist.
+- Never describe high-severity tickets as open merely because both counts exist.
+- Do not add, subtract, or otherwise combine the two counts.
+- If the action refers to both, refer to them separately. For example:
+  "Review the 2 currently open tickets and separately assess the 3 recorded
+  high-severity tickets." Never write "the 2 open high-severity tickets".
+- Known Contraction and Known Expansion are source-data amounts. Do not describe
+  them as agreed, contracted, committed, signed, or in a renewal contract unless
+  that wording appears in the deterministic evidence.
+- A recommended timeline may be proposed, but clearly frame it as a recommended
+  action, not an existing customer requirement.
+- Prefer review, validate, confirm, investigate, align, triage, and discuss when
+  the source facts do not establish a stronger conclusion.
 - Human review and customer engagement remain the final decision points.
 
 DETERMINISTIC SCORING RESULTS
 
 {scoring_context}
 
-CUSTOMER ACCOUNT DATA
-
-{account_json}
+{evidence_context}
 """
 
     response = narrative_client.messages.create(
         model=MODEL,
-        max_tokens=1000,
+        max_tokens=350,
         messages=[
             {
                 "role": "user",
@@ -306,31 +577,28 @@ CUSTOMER ACCOUNT DATA
     cleaned = clean_json_text(raw_text)
 
     try:
-        narrative = json.loads(cleaned)
-
+        payload = json.loads(cleaned)
     except (json.JSONDecodeError, TypeError, ValueError) as error:
         print(
-            f"Narrative parse failed for "
+            f"Recommendation parse failed for "
             f"{account['account_name']}: {error}"
         )
         print("Raw response:", raw_text)
         return None
 
-    result = empty_narrative()
+    recommendation = payload.get("recommended_next_step")
+    if not isinstance(recommendation, str) or not recommendation.strip():
+        return None
 
-    for field in result:
-        if field in narrative:
-            result[field] = narrative[field]
-
-    return result
+    return recommendation.strip()
 
 
 def build_account_result(account, health, narrative):
     """
     Assemble the final account result.
 
-    Every classification and every dollar figure here is deterministic. The
-    narrative fields are the only LLM contribution.
+    Every classification, dollar figure, summary, and evidence list here is
+    deterministic. Only Recommended Next Step may be AI-assisted.
     """
     billing = account["billing"]
     billing_available = account["data_availability"]["billing"]
@@ -470,6 +738,14 @@ def render_score_breakdown(result):
     return "\n".join(rows)
 
 
+def render_evidence(items, empty_note):
+    """Render an evidence list, or a stated absence when there is nothing."""
+    if not items:
+        return f"- {empty_note}"
+
+    return "\n".join(f"- {item}" for item in items)
+
+
 def save_markdown_report(account, result, workspace):
     # The filename is derived from a CRM-supplied account name, so it is
     # slugified and written through the workspace gate. A name containing a
@@ -526,15 +802,15 @@ Health Score is the points earned across available signals, normalized to 100. S
 
 ### Risk Drivers
 
-{chr(10).join(f"- {driver}" for driver in result['risk_drivers'])}
+{render_evidence(result['risk_drivers'], "No scored signal is at its lowest configured outcome for this account.")}
 
 ### Positive Signals
 
-{chr(10).join(f"- {signal}" for signal in result['positive_signals'])}
+{render_evidence(result['positive_signals'], "No scored signal is at its highest configured outcome for this account.")}
 
 ### Expansion Evidence
 
-{chr(10).join(f"- {item}" for item in result['expansion_evidence'])}
+{render_evidence(result['expansion_evidence'], "No current expansion evidence")}
 
 ---
 
@@ -597,9 +873,10 @@ Health Score is the points earned across available signals, normalized to 100. S
 - **Revenue Exposure:** Current ARR associated with an account assessed as having meaningful retention risk. This is not a prediction that this revenue will be lost.
 - **Known Contraction:** Revenue reduction explicitly identified in the source data.
 - **Known Expansion:** Additional recurring revenue explicitly identified in the source data.
+- **Risk Drivers / Positive Signals:** Individual scored signals sitting at their lowest / highest configured outcome under the PLS baseline. A signal between those two points is neither, and stays visible under Underlying Customer Signals. A component losing a single point does not make its other signals adverse.
 - **Expansion Opportunity:** Flagged from Known Expansion in the source data. Assessed independently of attention routing and it never improves the Health Score.
 - **Commercial Movement:** Known Contraction and Known Expansion are sourced directly from the client data, not generated by AI.
-- **AI contribution:** Health Summary, Risk Drivers, Positive Signals, Expansion Evidence, and Recommended Next Step are AI-assisted interpretation of the evidence above.
+- **AI contribution:** Recommended Next Step is AI-assisted. Health Summary, Risk Drivers, Positive Signals, Expansion Evidence, scores, classifications, and commercial figures are deterministic.
 """
 
     path = workspace.write_text(filename, content)
@@ -714,11 +991,13 @@ def summarize_reason(result):
     if result["risk_drivers"]:
         return result["risk_drivers"][0]
 
-    if result["expansion_evidence"]:
-        return result["expansion_evidence"][0]
-
+    # An account with no adverse signal is better described by what is actually
+    # positive than by the expansion placeholder.
     if result["positive_signals"]:
         return result["positive_signals"][0]
+
+    if result["expansion_evidence"]:
+        return result["expansion_evidence"][0]
 
     return result["health_summary"]
 
@@ -1206,7 +1485,7 @@ def print_run_header(workspace, client, effective_date, date_source, flags):
     print(f"Input:           {workspace.input_dir}")
     print(f"Outputs:         {workspace.outputs_dir}")
     print(
-        f"Effective Date:  {effective_date.strftime('%Y-%m-%d')} "
+        f"Effective Date:  {effective_date.strftime('%m/%d/%Y')} "
         f"({date_source})"
     )
 
@@ -1293,33 +1572,32 @@ def run(args):
 
         health = health_model.score_account(account, health_rules)
 
-        narrative = None
+        # All factual narrative is deterministic and therefore repeatable.
+        narrative = build_deterministic_narrative(account, health, health_rules)
+
+        recommendation_available = False
 
         if narrative_client is not None:
-            narrative = analyze_account_narrative(
-                account, health, narrative_client
+            recommendation = analyze_account_narrative(
+                account,
+                health,
+                narrative,
+                narrative_client,
             )
 
-        narrative_available = narrative is not None
-
-        # The score is deterministic, so a missing narrative must not drop the
-        # account out of the portfolio and skew the totals.
-        if narrative is None:
-            if narrative_client is not None:
+            if recommendation is None:
                 narrative_failures += 1
-                print("Proceeding with deterministic results only.")
-
-            narrative = empty_narrative()
-            narrative["health_summary"] = (
-                "Narrative generation was not performed for this account. "
-                "The deterministic scoring results below are unaffected."
-                if args.no_ai or args.validate_only
-                else "Narrative generation was unavailable for this account. "
-                "The deterministic scoring results below are unaffected."
+                print("Proceeding without AI-assisted recommendation.")
+            else:
+                narrative["recommended_next_step"] = recommendation
+                recommendation_available = True
+        else:
+            narrative["recommended_next_step"] = (
+                "AI-assisted recommendation was not generated for this run."
             )
 
         result = build_account_result(account, health, narrative)
-        result["narrative_available"] = narrative_available
+        result["narrative_available"] = recommendation_available
 
         print(
             "Health:",
@@ -1368,7 +1646,7 @@ def run(args):
         workspace,
         health_rules,
         client["name"],
-        effective_date.strftime("%Y-%m-%d"),
+        effective_date.strftime("%m/%d/%Y"),
     )
 
     resolved_config_text = client_config.dump_resolved_rules(
@@ -1463,7 +1741,7 @@ def report_validation_only(
         f"Signal Coverage range:    "
         f"{min(coverages)}% to {max(coverages)}%"
     )
-    print(f"Effective date:           {effective_date:%Y-%m-%d} ({date_source})")
+    print(f"Effective date:           {effective_date:%m/%d/%Y} ({date_source})")
     print(
         f"Overrides applied:        "
         f"{len(client['overrides'])}"
